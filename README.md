@@ -37,10 +37,10 @@ An INI file can specify search parameters under a [search] section. See test_con
 mesh_terms = Endometrial Neoplasms, Ovarian Neoplasms
 
 # Author filters (optional; comma-separated; e.g., Lastname Initials)
-authors = Gilbert P, Smith J
+authors = Sanders S, Smith J
 
 # Organization/Affiliation filters (optional; comma-separated)
-organizations = Harvard Medical School, National Institutes of Health
+organizations = FRED HUTCHINSON CANCER CENTER 
 
 days = 30
 max_results = 1000
