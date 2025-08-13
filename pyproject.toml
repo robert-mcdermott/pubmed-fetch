@@ -7,3 +7,23 @@ requires-python = ">=3.13"
 dependencies = [
     "requests>=2.32.4",
 ]
+
+[project.optional-dependencies]
+# Developer tools installed with: uv sync --extra dev
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.5.0",
+]
+
+[tool.ruff]
+# Target Python version used for linting/formatting
+target-version = "py313"
+line-length = 120
+
+[tool.ruff.lint]
+# Use default rule set; configure ignores here if needed
+select = ["E", "F", "W"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
