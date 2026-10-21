@@ -112,11 +112,102 @@ Each article includes:
 `search_info` records provenance and completeness: `tool` (name, version), `generated_on` (UTC), `source` (`search`, `pmids` or `raw`), `query`, `query_translation`, `query_warnings`, `filters`, `date_type`, `date_range`, `date_windows`, `total_found`, `max_results`, `expected`, `retrieved`, `truncated`, `complete`, `failed_batches`, `skipped_records`, `skipped_existing`, lookup failure counts, and `total_articles`.
 
 ### SQLite tables
-`articles` (one row per PMID, including `record_json` with the full record), `authors`, `affiliations`, `mesh` (one row per descriptor/qualifier pair), `keywords`, `publication_types`, `grants`, and `runs` (the `search_info` of every run). For example:
-```sql
-SELECT m.descriptor, COUNT(*) FROM mesh m JOIN articles a USING (pmid)
-WHERE a.year >= 2024 AND m.descriptor_major GROUP BY 1 ORDER BY 2 DESC LIMIT 10;
+| Table | One row per | Key columns |
+| --- | --- | --- |
+| `articles` | article (primary key `pmid`) | `title`, `abstract`, `journal`, `journal_abbrev`, `date`, `year`, `epub_date`, `doi`, `pmc_id`, `is_retracted`, `access_type`, `fulltext_url`, `license`, `citation_count`, `relative_citation_ratio`, `nih_percentile`, `record_json` (the full record) |
+| `authors` | author of an article | `pmid`, `position`, `name`, `last_name`, `fore_name`, `orcid` |
+| `affiliations` | author affiliation | `pmid`, `author_position`, `affiliation` |
+| `mesh` | MeSH descriptor/qualifier pair | `pmid`, `descriptor`, `descriptor_major`, `qualifier`, `qualifier_major` |
+| `keywords`, `publication_types`, `grants` | keyword / type / grant | `pmid`, plus `keyword` / `publication_type` / `grant_id`, `agency`, `country` |
+| `runs` | run of pubmed-fetch | `finished_at`, `search_info` (JSON) |
+
+The `mesh` table has one row per qualifier, so use `COUNT(DISTINCT pmid)` when counting articles.
+
+### Example: build and query a research database
+Collect a quarter's worth of ovarian cancer articles, with citation metrics and the open-access PDFs:
+```bash
+uv run pubmed-fetch --mesh-terms "Ovarian Neoplasms" --start-date 2024-01-01 --end-date 2024-03-31 \
+  --max-results 60 --icite --download-fulltext papers --output ovarian.sqlite --email you@example.com
 ```
+Open-access PDFs average several MB each (60 articles downloaded about 350 MB in testing), so start with a small `--max-results` or add `--download-formats txt` for plain text only. Running more searches with the same `--output` adds to the same database.
+
+Then query it with the `sqlite3` command-line tool (preinstalled on macOS and most Linux systems), e.g. `sqlite3 -header -column ovarian.sqlite "<query>"`:
+
+```sql
+-- Overview
+SELECT COUNT(*) AS articles, SUM(access_type = 'open') AS open_access,
+       SUM(is_retracted) AS retracted, ROUND(AVG(citation_count), 1) AS avg_citations
+FROM articles;
+
+-- Most-cited articles (needs --icite)
+SELECT pmid, citation_count AS cites, ROUND(relative_citation_ratio, 2) AS rcr, title
+FROM articles WHERE citation_count IS NOT NULL
+ORDER BY citation_count DESC LIMIT 10;
+
+-- Main topics: MeSH terms marked as a major topic (directly or via a qualifier)
+SELECT descriptor, COUNT(DISTINCT pmid) AS articles
+FROM mesh WHERE descriptor_major OR qualifier_major
+GROUP BY descriptor ORDER BY articles DESC LIMIT 10;
+
+-- Journals, and how much of each is open access
+SELECT journal_abbrev AS journal, COUNT(*) AS articles, SUM(access_type = 'open') AS open_access
+FROM articles GROUP BY journal_abbrev ORDER BY articles DESC LIMIT 10;
+
+-- Funders
+SELECT agency, COUNT(DISTINCT pmid) AS articles
+FROM grants WHERE agency IS NOT NULL
+GROUP BY agency ORDER BY articles DESC LIMIT 10;
+
+-- Most frequent authors, identified by ORCID rather than by name
+SELECT name, orcid, COUNT(*) AS articles
+FROM authors WHERE orcid IS NOT NULL
+GROUP BY orcid ORDER BY articles DESC LIMIT 10;
+
+-- Articles with an author at a given institution
+SELECT DISTINCT a.pmid, a.title
+FROM articles a JOIN affiliations f USING (pmid)
+WHERE f.affiliation LIKE '%Fudan University%';
+
+-- Abstracts mentioning a phrase, newest first
+SELECT pmid, date, title FROM articles
+WHERE abstract LIKE '%PARP inhibitor%' ORDER BY date DESC;
+
+-- Retracted articles and their retraction notices
+SELECT pmid, title, json_extract(c.value, '$.pmid') AS retraction_notice
+FROM articles, json_each(record_json, '$.comments_corrections') AS c
+WHERE is_retracted AND json_extract(c.value, '$.type') = 'RetractionIn';
+
+-- Downloaded files, with their licenses (paths are relative to where you ran pubmed-fetch)
+SELECT a.pmid, a.license, json_extract(link.value, '$.path') AS file
+FROM articles a, json_each(a.record_json, '$.fulltext.download_links') AS link
+WHERE json_extract(link.value, '$.path') IS NOT NULL;
+
+-- History of the runs that built the database
+SELECT run_id, finished_at,
+       json_extract(search_info, '$.date_range.start_date') AS start_date,
+       json_extract(search_info, '$.date_range.end_date') AS end_date,
+       json_extract(search_info, '$.total_found') AS found,
+       json_extract(search_info, '$.total_articles') AS in_database
+FROM runs;
+```
+Fields that aren't columns can be read from `record_json` with SQLite's JSON functions, as in the last three queries.
+
+The same database loads straight into pandas (here run ad hoc with `uv run --with pandas`, without adding it to the project):
+```bash
+uv run --with pandas python - <<'EOF'
+import sqlite3
+import pandas as pd
+
+db = sqlite3.connect("ovarian.sqlite")
+articles = pd.read_sql("SELECT pmid, year, journal_abbrev, access_type, citation_count FROM articles", db)
+print(articles.groupby("access_type")["citation_count"].describe()[["count", "mean", "max"]])
+
+topics = pd.read_sql("SELECT DISTINCT pmid, descriptor FROM mesh WHERE descriptor_major OR qualifier_major", db)
+print(topics["descriptor"].value_counts().head(10))
+EOF
+```
+
+To keep the database current, run the same search on a schedule with `--since-last-run` (see [Incremental runs](#incremental-runs)); new articles are added and existing ones refreshed.
 
 ## Incremental runs
 `--since-last-run STATE` starts from the end date stored in the STATE file (or from `--days` on the first run), then updates the file after a complete run. It uses the Entrez date (`edat`) unless `--date-type` is given. Runs overlap by one day so nothing indexed late is missed; use SQLite output, `--merge` or `--resume` to de-duplicate.
