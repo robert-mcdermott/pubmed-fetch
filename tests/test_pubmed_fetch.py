@@ -1,5 +1,7 @@
+import csv
 import json
 import xml.etree.ElementTree as ET
+from datetime import date
 
 import pytest
 import requests
@@ -67,6 +69,15 @@ class FakeResponse:
 
     def json(self):
         return self._json
+
+    def iter_content(self, chunk_size=1):
+        yield self.content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class FakeSession:
@@ -183,16 +194,54 @@ def test_search_raises_on_eutils_error():
         searcher.search_pubmed(mesh_terms=["X"])
 
 
-def test_failed_efetch_batch_is_skipped():
-    responses = iter(
-        [
-            FakeResponse(status=500),
-            FakeResponse(b"<PubmedArticleSet>" + ET.tostring(make_article()) + b"</PubmedArticleSet>"),
-        ]
-    )
-    searcher = make_searcher({"efetch.fcgi": lambda u, p: next(responses)})
+ARTICLE_SET = b"<PubmedArticleSet>" + ET.tostring(make_article()) + b"</PubmedArticleSet>"
+
+
+def test_failed_efetch_batch_is_skipped(caplog):
+    def efetch(url, params):
+        return FakeResponse(status=500) if params["id"] == "1" else FakeResponse(ARTICLE_SET)
+
+    searcher = make_searcher({"efetch.fcgi": efetch})
     searcher.batch_size = 1
     assert len(searcher.fetch_article_details(["1", "2"])) == 1
+    assert "Batch 1/2 failed" in caplog.text
+
+
+def test_efetch_batch_is_retried_once():
+    responses = iter([FakeResponse(status=400), FakeResponse(ARTICLE_SET)])
+    searcher = make_searcher({"efetch.fcgi": lambda u, p: next(responses)})
+    assert len(searcher.fetch_article_details(["1"])) == 1
+
+
+def test_all_efetch_batches_failing_raises():
+    searcher = make_searcher({"efetch.fcgi": lambda u, p: FakeResponse(status=400)})
+    with pytest.raises(pf.PubMedError, match="Could not fetch article details"):
+        searcher.fetch_article_details(["1"])
+
+
+def test_search_uses_explicit_date_range():
+    searcher = make_searcher({"esearch.fcgi": esearch_response(0)})
+    searcher.search_pubmed(mesh_terms=["X"], start_date=date(2024, 1, 1), end_date=date(2024, 6, 30))
+    params = searcher.session.calls[0][2]
+    assert (params["mindate"], params["maxdate"]) == ("2024/01/01", "2024/06/30")
+    assert searcher.search_info["date_range"] == {"start_date": "2024-01-01", "end_date": "2024-06-30"}
+
+
+def test_resolve_date_range():
+    today = date(2024, 3, 31)
+    assert pf.resolve_date_range(30, today=today) == (date(2024, 3, 1), today)
+    assert pf.resolve_date_range(30, start_date=date(2024, 1, 1), today=today) == (date(2024, 1, 1), today)
+    assert pf.resolve_date_range(10, end_date=date(2024, 1, 11)) == (date(2024, 1, 1), date(2024, 1, 11))
+    with pytest.raises(pf.PubMedError):
+        pf.resolve_date_range(start_date=date(2024, 2, 1), end_date=date(2024, 1, 1))
+
+
+def test_parse_arguments_dates():
+    args = pf.parse_arguments(["--mesh-terms", "X", "--start-date", "2024-01-01", "--end-date", "2024-02-01"])
+    assert (args.start_date, args.end_date) == (date(2024, 1, 1), date(2024, 2, 1))
+    for bad in (["--start-date", "01/02/2024"], ["--days", "5", "--start-date", "2024-01-01"]):
+        with pytest.raises(SystemExit):
+            pf.parse_arguments(["--mesh-terms", "X", *bad])
 
 
 def test_parse_article_handles_inline_markup_and_authors():
@@ -323,7 +372,109 @@ def test_load_config_and_precedence(tmp_path, monkeypatch):
     assert settings["mesh_terms"] == ["A", "B"]
     assert settings["email"] == "cfg@example.com"
     assert settings["api_key"] == "envkey"
-    assert settings["output_file"] == "pubmed_articles.json"
+    assert settings["output_file"] is None
+    assert settings["download_formats"] == ["pdf"]
+
+
+def test_load_config_dates_formats_and_downloads(tmp_path):
+    config_file = tmp_path / "c.ini"
+    config_file.write_text(
+        "[search]\nstart_date = 2024-01-01\nend_date = 2024-12-31\nformat = CSV\n"
+        "download_dir = papers\ndownload_formats = pdf, xml\n"
+    )
+    config = pf.load_config(config_file)
+    assert config == {
+        "start_date": date(2024, 1, 1),
+        "end_date": date(2024, 12, 31),
+        "format": "csv",
+        "download_dir": "papers",
+        "download_formats": ["pdf", "xml"],
+    }
+    # --days on the command line replaces the config file's start_date but keeps its end_date.
+    settings = pf.resolve_settings(pf.parse_arguments(["--days", "7"]), config)
+    assert (settings["start_date"], settings["end_date"], settings["days"]) == (None, date(2024, 12, 31), 7)
+
+    config_file.write_text("[search]\nformat = xlsx\n")
+    with pytest.raises(ValueError, match="format"):
+        pf.load_config(config_file)
+
+
+@pytest.mark.parametrize(
+    ("filename", "fmt", "expected"),
+    [
+        (None, None, ("pubmed_articles.json", "json")),
+        (None, "csv", ("pubmed_articles.csv", "csv")),
+        ("out.JSONL", None, ("out.JSONL", "jsonl")),
+        ("out.txt", None, ("out.txt", "json")),
+        ("out.json", "csv", ("out.json", "csv")),
+    ],
+)
+def test_resolve_output(filename, fmt, expected):
+    assert pf.resolve_output(filename, fmt) == expected
+
+
+SAMPLE_ARTICLES = [
+    {
+        "pmid": "1",
+        "title": 'A "quoted", title',
+        "authors": ["Smith, Jane", "Lee"],
+        "mesh_terms": ["X"],
+        "keywords": [],
+        "publication_types": ["Review"],
+        "abstract": "Line one\nline two",
+        "fulltext": {"url": "https://pmc/1", "access_type": "open", "license": "CC BY"},
+    },
+    {"pmid": "2", "title": "Second", "authors": [], "fulltext": None},
+]
+
+
+def test_save_results_csv(tmp_path):
+    out = tmp_path / "out.csv"
+    pf.PubMedSearcher(session=FakeSession({})).save_results(SAMPLE_ARTICLES, filename=out)
+    rows = list(csv.DictReader(out.open(encoding="utf-8", newline="")))
+    assert list(rows[0]) == pf.CSV_FIELDS
+    assert rows[0]["title"] == 'A "quoted", title'
+    assert rows[0]["authors"] == "Smith, Jane; Lee"
+    assert rows[0]["abstract"] == "Line one\nline two"
+    assert (rows[0]["access_type"], rows[0]["license"], rows[0]["fulltext_url"]) == ("open", "CC BY", "https://pmc/1")
+    assert rows[1]["access_type"] == ""
+
+
+def test_save_results_jsonl(tmp_path):
+    out = tmp_path / "out.jsonl"
+    pf.PubMedSearcher(session=FakeSession({})).save_results(SAMPLE_ARTICLES, filename=out)
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["pmid"] for line in lines] == ["1", "2"]
+
+
+def test_download_fulltext(tmp_path):
+    base = "https://pmc-oa-opendata.s3.amazonaws.com/PMC1.1/"
+
+    def download(url, params):
+        return FakeResponse(status=404) if url.endswith("missing.pdf") else FakeResponse(b"data:" + url.encode())
+
+    links = [
+        {"format": "pdf", "url": base + "PMC1.1.pdf"},
+        {"format": "xml", "url": base + "PMC1.1.xml"},
+        {"format": "pdf", "url": base + "existing.pdf"},
+        {"format": "pdf", "url": base + "missing.pdf"},
+    ]
+    articles = [{"pmid": "1", "fulltext": {"download_links": links}}, {"pmid": "2", "fulltext": None}]
+    (tmp_path / "existing.pdf").write_bytes(b"old")
+    searcher = make_searcher({"amazonaws.com": download})
+
+    assert searcher.download_fulltext(articles, tmp_path, formats=["pdf"]) == (1, 1)
+    assert (tmp_path / "PMC1.1.pdf").read_bytes() == b"data:" + (base + "PMC1.1.pdf").encode()
+    assert (tmp_path / "existing.pdf").read_bytes() == b"old"
+    assert not (tmp_path / "PMC1.1.xml").exists()
+    assert not list(tmp_path.glob("*.part"))
+    assert links[0]["path"] == str(tmp_path / "PMC1.1.pdf")
+    assert links[2]["path"] == str(tmp_path / "existing.pdf")
+    assert "path" not in links[1] and "path" not in links[3]
+
+
+def test_main_rejects_download_without_fulltext(tmp_path):
+    assert pf.main(["--mesh-terms", "X", "--no-fulltext", "--download-fulltext", str(tmp_path), "-q"]) == 1
 
 
 def test_create_sample_config_does_not_overwrite(tmp_path):

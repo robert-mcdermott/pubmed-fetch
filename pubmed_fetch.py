@@ -3,16 +3,19 @@
 PubMed Search Utility
 
 Search PubMed (NCBI E-utilities) for articles matching MeSH terms, authors and/or
-organizations within a recent publication-date window. Results are saved as JSON
-with full abstracts and full-text availability from PubMed Central.
+organizations within a publication-date window. Results are saved as JSON, JSONL or CSV
+with full abstracts and full-text availability from PubMed Central; open-access
+full text can optionally be downloaded.
 
 Usage:
     uv run pubmed_fetch.py --mesh-terms "Endometrial Neoplasms" "Ovarian Neoplasms" --days 30
+    uv run pubmed_fetch.py --author "Smith J" --start-date 2024-01-01 --end-date 2024-12-31 --output smith.csv
     uv run pubmed_fetch.py --config config.ini
 """
 
 import argparse
 import configparser
+import csv
 import json
 import logging
 import os
@@ -20,7 +23,8 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -39,11 +43,36 @@ DEFAULTS = {
     "authors": [],
     "organizations": [],
     "days": 30,
+    "start_date": None,
+    "end_date": None,
     "max_results": 1000,
-    "output_file": "pubmed_articles.json",
+    "output_file": None,
+    "format": None,
     "email": None,
     "api_key": None,
+    "download_dir": None,
+    "download_formats": ["pdf"],
 }
+
+OUTPUT_FORMATS = ("json", "jsonl", "csv")
+DOWNLOAD_FORMATS = ("pdf", "xml", "txt")
+CSV_FIELDS = [
+    "pmid",
+    "title",
+    "authors",
+    "journal",
+    "date",
+    "doi",
+    "pmc_id",
+    "url",
+    "mesh_terms",
+    "keywords",
+    "publication_types",
+    "fulltext_url",
+    "access_type",
+    "license",
+    "abstract",
+]
 
 MONTHS = {
     m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)
@@ -85,6 +114,36 @@ def build_query(mesh_terms=None, authors=None, organizations=None):
     ]
     subqueries = ["(" + " OR ".join(f"{_quote(t)}[{tag}]" for t in terms) + ")" for terms, tag in groups if terms]
     return " AND ".join(subqueries)
+
+
+def resolve_date_range(days_back=30, start_date=None, end_date=None, today=None):
+    """
+    Return (start, end) dates. Explicit dates win; a missing end defaults to today and a
+    missing start defaults to ``days_back`` days before the end.
+    """
+    end = end_date or today or date.today()
+    start = start_date or end - timedelta(days=days_back)
+    if start > end:
+        raise PubMedError(f"Start date {start} is after end date {end}.")
+    return start, end
+
+
+def resolve_output(filename=None, fmt=None):
+    """Return (filename, format). The format comes from ``fmt``, else the file extension, else JSON."""
+    ext_fmt = {f".{f}": f for f in OUTPUT_FORMATS}.get(Path(filename).suffix.lower()) if filename else None
+    fmt = fmt or ext_fmt or "json"
+    return filename or f"pubmed_articles.{fmt}", fmt
+
+
+def _csv_row(article):
+    fulltext = article.get("fulltext") or {}
+    row = {key: article.get(key, "") for key in CSV_FIELDS}
+    for key in ("authors", "mesh_terms", "keywords", "publication_types"):
+        row[key] = "; ".join(article.get(key) or [])
+    row["fulltext_url"] = fulltext.get("url", "")
+    row["access_type"] = fulltext.get("access_type", "")
+    row["license"] = fulltext.get("license", "")
+    return row
 
 
 def _normalize_pmcid(pmc_id):
@@ -160,13 +219,23 @@ class PubMedSearcher:
             raise PubMedError(_text(error))
         return root
 
-    def search_pubmed(self, mesh_terms=None, authors=None, organizations=None, days_back=30, max_results=1000):
+    def search_pubmed(
+        self,
+        mesh_terms=None,
+        authors=None,
+        organizations=None,
+        days_back=30,
+        max_results=1000,
+        start_date=None,
+        end_date=None,
+    ):
         """
         Search PubMed for articles using any combination of:
         - MeSH terms (list of strings)
         - authors (list of strings; matched with [Author])
         - organizations/affiliations (list of strings; matched with [Affiliation])
-        and restrict to a publication date window.
+        and restrict to a publication date window: ``start_date``..``end_date`` (dates), or the
+        ``days_back`` days before ``end_date`` (default today) when ``start_date`` is not given.
 
         Returns a list of article dicts. Details of the search are stored in ``self.search_info``.
         Raises PubMedError if the search itself fails.
@@ -177,11 +246,10 @@ class PubMedSearcher:
                 "No search terms provided. Specify at least one of --mesh-terms, --author, --organization."
             )
 
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days_back)
+        start_date, end_date = resolve_date_range(days_back, start_date, end_date)
 
         log.info("Search query: %s", search_term)
-        log.info("Date range: %s to %s", start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+        log.info("Date range: %s to %s", start_date.isoformat(), end_date.isoformat())
 
         try:
             root = self._eutils(
@@ -207,7 +275,7 @@ class PubMedSearcher:
             "mesh_terms": list(mesh_terms or []),
             "authors": list(authors or []),
             "organizations": list(organizations or []),
-            "date_range": {"start_date": start_date.strftime("%Y-%m-%d"), "end_date": end_date.strftime("%Y-%m-%d")},
+            "date_range": {"start_date": start_date.isoformat(), "end_date": end_date.isoformat()},
             "total_found": total_count,
         }
 
@@ -241,16 +309,26 @@ class PubMedSearcher:
             [{"id": ",".join(pmids[i : i + self.batch_size])} for i in range(0, len(pmids), self.batch_size)]
         )
 
-    def _efetch_batches(self, batches):
-        articles = []
+    def _efetch_batches(self, batches, attempts=2):
+        articles, failed = [], 0
         for num, params in enumerate(batches, 1):
             log.info("Fetching batch %d/%d...", num, len(batches))
-            try:
-                root = self._eutils("efetch.fcgi", {"db": "pubmed", "retmode": "xml", **params})
-            except (requests.RequestException, ET.ParseError, PubMedError) as e:
-                log.warning("Batch %d/%d failed and was skipped: %s", num, len(batches), e)
+            # The history server intermittently answers 400 for a valid WebEnv, so retry once more.
+            for attempt in range(1, attempts + 1):
+                try:
+                    root = self._eutils("efetch.fcgi", {"db": "pubmed", "retmode": "xml", **params})
+                    break
+                except (requests.RequestException, ET.ParseError, PubMedError) as e:
+                    error = e
+                    if attempt < attempts:
+                        time.sleep(2)
+            else:
+                failed += 1
+                log.warning("Batch %d/%d failed and was skipped: %s", num, len(batches), error)
                 continue
             articles.extend(a for a in map(self.parse_article, root.iter("PubmedArticle")) if a)
+        if batches and failed == len(batches):
+            raise PubMedError(f"Could not fetch article details from PubMed: {error}")
         log.info("Total articles retrieved: %d", len(articles))
         return articles
 
@@ -443,6 +521,70 @@ class PubMedSearcher:
             json.dump(data, f, indent=2, ensure_ascii=False)
         log.info("Results saved to: %s", filename)
 
+    def save_results(self, articles, filename=None, fmt=None):
+        """Save results as JSON (with search_info), JSONL (one article per line) or CSV."""
+        filename, fmt = resolve_output(filename, fmt)
+        if fmt == "json":
+            return self.save_to_json(articles, filename)
+        with open(filename, "w", encoding="utf-8", newline="") as f:
+            if fmt == "jsonl":
+                f.writelines(json.dumps(article, ensure_ascii=False) + "\n" for article in articles)
+            elif fmt == "csv":
+                writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+                writer.writeheader()
+                writer.writerows(map(_csv_row, articles))
+            else:
+                raise ValueError(f"Unknown output format: {fmt}")
+        log.info("Results saved to: %s", filename)
+
+    def download_fulltext(self, articles, directory, formats=("pdf",)):
+        """
+        Download available full-text files (from ``fulltext.download_links``) into ``directory``.
+        Existing files are skipped. Each downloaded link gets a ``path`` entry.
+        Returns (downloaded, failed) counts.
+        """
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        links = [
+            link
+            for article in articles
+            for link in ((article.get("fulltext") or {}).get("download_links") or [])
+            if link["format"] in formats
+        ]
+        if not links:
+            log.info("No downloadable full-text files (%s) found.", ", ".join(formats))
+            return 0, 0
+
+        log.info("Downloading %d full-text files to %s...", len(links), directory)
+        with ThreadPoolExecutor(max_workers=self.fulltext_workers) as pool:
+            results = list(pool.map(lambda link: self._download_file(link, directory), links))
+        downloaded, failed = results.count(True), results.count(False)
+        if failed:
+            log.warning("Failed to download %d of %d files.", failed, len(links))
+        log.info("Downloaded %d files (%d already present).", downloaded, results.count(None))
+        return downloaded, failed
+
+    def _download_file(self, link, directory):
+        """Download one link. Returns True if downloaded, None if already present, False on failure."""
+        dest = directory / link["url"].rsplit("/", 1)[-1]
+        if dest.exists() and dest.stat().st_size:
+            link["path"] = str(dest)
+            return None
+        partial = dest.with_name(dest.name + ".part")
+        try:
+            with self.session.get(link["url"], stream=True, timeout=self.timeout) as response:
+                response.raise_for_status()
+                with open(partial, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=1 << 16):
+                        f.write(chunk)
+            partial.replace(dest)
+        except (requests.RequestException, OSError) as e:
+            log.debug("Download failed for %s: %s", link["url"], e)
+            partial.unlink(missing_ok=True)
+            return False
+        link["path"] = str(dest)
+        return True
+
 
 def _split_list(value):
     return [item.strip() for item in value.split(",") if item.strip()]
@@ -466,10 +608,26 @@ def load_config(config_file):
     for key in ("days", "max_results"):
         if key in section:
             settings[key] = section.getint(key)
-    for key in ("output_file", "email", "api_key"):
+    for key in ("output_file", "email", "api_key", "download_dir"):
         if section.get(key, "").strip():
             settings[key] = section[key].strip()
+    for key in ("start_date", "end_date"):
+        if section.get(key, "").strip():
+            settings[key] = date.fromisoformat(section[key].strip())
+    if section.get("format", "").strip():
+        settings["format"] = _choice(section["format"], OUTPUT_FORMATS, "format")
+    if "download_formats" in section:
+        settings["download_formats"] = [
+            _choice(f, DOWNLOAD_FORMATS, "download_formats") for f in _split_list(section["download_formats"])
+        ]
     return settings
+
+
+def _choice(value, choices, name):
+    value = value.strip().lower()
+    if value not in choices:
+        raise ValueError(f"{name} must be one of {', '.join(choices)}, got {value!r}")
+    return value
 
 
 def _positive_int(value):
@@ -477,6 +635,13 @@ def _positive_int(value):
     if number <= 0:
         raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
     return number
+
+
+def _iso_date(value):
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a date as YYYY-MM-DD, got {value!r}") from None
 
 
 def parse_arguments(argv=None):
@@ -490,6 +655,8 @@ Examples:
   %(prog)s --author "Gilbert P" --days 30
   %(prog)s --organization "Harvard Medical School" --days 365
   %(prog)s --mesh-terms "Breast Neoplasms" --author "Smith J" --days 7 --output results.json
+  %(prog)s --author "Smith J" --start-date 2024-01-01 --end-date 2024-12-31 --output smith.csv
+  %(prog)s --mesh-terms "Ovarian Neoplasms" --days 7 --download-fulltext papers/ --download-formats pdf xml
   %(prog)s --config config.ini
 
 Environment variables:
@@ -507,18 +674,42 @@ Environment variables:
         nargs="+",
         help='Organization/Affiliation name(s) (e.g., "Harvard Medical School"). Space-separated for multiple.',
     )
-    parser.add_argument(
-        "--days", type=_positive_int, help=f"Number of past days to include in search (default: {DEFAULTS['days']})"
+    when = parser.add_mutually_exclusive_group()
+    when.add_argument(
+        "--days",
+        type=_positive_int,
+        help=f"Number of days before the end date to include (default: {DEFAULTS['days']})",
     )
+    when.add_argument("--start-date", type=_iso_date, help="Earliest publication date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=_iso_date, help="Latest publication date (YYYY-MM-DD; default: today)")
     parser.add_argument(
         "--max-results",
         type=_positive_int,
         help=f"Maximum number of results to fetch (default: {DEFAULTS['max_results']}, PubMed limit: 10000)",
     )
-    parser.add_argument("--output", help=f"Output JSON filename (default: {DEFAULTS['output_file']})")
+    parser.add_argument(
+        "--output",
+        help="Output filename (default: pubmed_articles.<format>); a .json/.jsonl/.csv extension sets the format",
+    )
+    parser.add_argument(
+        "--format",
+        choices=OUTPUT_FORMATS,
+        help="Output format: json (with search_info), jsonl (one article per line) or csv (default: json)",
+    )
     parser.add_argument("--email", help="Your email address for NCBI API (recommended)")
     parser.add_argument("--api-key", help="NCBI API key; raises the rate limit from 3 to 10 requests/second")
     parser.add_argument("--no-fulltext", action="store_true", help="Skip the PMC full-text availability check")
+    parser.add_argument(
+        "--download-fulltext",
+        metavar="DIR",
+        help="Download available PMC full-text files (open access and author manuscripts) into DIR",
+    )
+    parser.add_argument(
+        "--download-formats",
+        nargs="+",
+        choices=DOWNLOAD_FORMATS,
+        help="File formats to download with --download-fulltext (default: pdf)",
+    )
     parser.add_argument("--config", help="Configuration file (INI format)")
     parser.add_argument("--create-config", metavar="FILENAME", help="Create a sample configuration file and exit")
     verbosity = parser.add_mutually_exclusive_group()
@@ -540,11 +731,20 @@ mesh_terms = Endometrial Neoplasms, Ovarian Neoplasms
 # Number of past days to include in search
 days = 30
 
+# Or an absolute publication date range (YYYY-MM-DD; start_date overrides days)
+#start_date = 2024-01-01
+#end_date = 2024-12-31
+
 # Maximum number of results to fetch
 max_results = 1000
 
-# Output JSON filename
+# Output filename; the extension (.json, .jsonl, .csv) selects the format unless format is set
 output_file = pubmed_articles.json
+#format = csv
+
+# Download available PMC full-text files into this directory (optional)
+#download_dir = papers
+#download_formats = pdf, xml
 
 # Your email address (recommended for NCBI API)
 email = user@example.com
@@ -574,15 +774,23 @@ def resolve_settings(args, config):
         "authors": args.author,
         "organizations": args.organization,
         "days": args.days,
+        "start_date": args.start_date,
+        "end_date": args.end_date,
         "max_results": args.max_results,
         "output_file": args.output,
+        "format": args.format,
         "email": args.email,
         "api_key": args.api_key,
+        "download_dir": args.download_fulltext,
+        "download_formats": args.download_formats,
     }
     env = {"email": os.environ.get("NCBI_EMAIL"), "api_key": os.environ.get("NCBI_API_KEY")}
     settings = dict(DEFAULTS)
     for layer in (config, env, cli):
         settings.update({k: v for k, v in layer.items() if v is not None})
+    # --days on the command line replaces a start_date from the config file.
+    if args.days is not None and args.start_date is None:
+        settings["start_date"] = None
     return settings
 
 
@@ -617,6 +825,9 @@ def main(argv=None):
             "Use --help for usage information or --create-config to create a sample config file."
         )
         return 1
+    if settings["download_dir"] and args.no_fulltext:
+        log.error("Error: --download-fulltext needs the full-text check; remove --no-fulltext.")
+        return 1
     if not settings["email"]:
         log.warning("Tip: pass --email (or set NCBI_EMAIL) so NCBI can contact you about heavy usage.")
 
@@ -628,6 +839,8 @@ def main(argv=None):
             organizations=settings["organizations"],
             days_back=settings["days"],
             max_results=settings["max_results"],
+            start_date=settings["start_date"],
+            end_date=settings["end_date"],
         )
     except PubMedError as e:
         log.error("%s", e)
@@ -636,12 +849,19 @@ def main(argv=None):
     if articles and not args.no_fulltext:
         searcher.add_fulltext_info(articles)
 
+    if articles and settings["download_dir"]:
+        try:
+            searcher.download_fulltext(articles, settings["download_dir"], settings["download_formats"])
+        except OSError as e:
+            log.error("Error creating download directory: %s", e)
+            return 1
+
     if not args.quiet:
         searcher.display_results(articles)
 
     if articles:
         try:
-            searcher.save_to_json(articles, filename=settings["output_file"])
+            searcher.save_results(articles, filename=settings["output_file"], fmt=settings["format"])
         except OSError as e:
             log.error("Error saving to file: %s", e)
             return 1
