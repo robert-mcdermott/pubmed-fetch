@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/robert-mcdermott/pubmed-fetch/schema/output.schema.json",
+  "title": "pubmed-fetch output",
+  "description": "A JSON output document (schema_version 2). JSONL output contains one $defs/article per line.",
+  "type": "object",
+  "required": ["schema_version", "search_info", "articles"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 2},
+    "search_info": {"$ref": "#/$defs/search_info"},
+    "articles": {"type": "array", "items": {"$ref": "#/$defs/article"}}
+  },
+  "$defs": {
+    "str": {"type": ["string", "null"]},
+    "int": {"type": ["integer", "null"]},
+    "num": {"type": ["number", "null"]},
+    "bool": {"type": ["boolean", "null"]},
+    "date": {"type": ["string", "null"], "pattern": "^\\d{4}(-\\d{2}(-\\d{2})?)?$"},
+    "strings": {"type": "array", "items": {"type": "string"}},
+    "search_info": {
+      "type": "object",
+      "description": "Provenance and completeness of the run that produced the output.",
+      "required": ["tool", "generated_on", "source", "complete", "failed_batches", "total_articles"],
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "type": "object",
+          "required": ["name", "version"],
+          "additionalProperties": false,
+          "properties": {"name": {"type": "string"}, "version": {"type": "string"}}
+        },
+        "schema_version": {"const": 2},
+        "generated_on": {"type": "string", "description": "UTC ISO-8601 timestamp"},
+        "source": {"enum": ["search", "pmids", "raw"]},
+        "query": {"$ref": "#/$defs/str"},
+        "query_translation": {"$ref": "#/$defs/str", "description": "The query as PubMed interpreted it"},
+        "query_warnings": {"$ref": "#/$defs/strings"},
+        "filters": {"type": "object"},
+        "date_type": {"enum": ["pdat", "edat", "mdat"]},
+        "date_range": {
+          "type": "object",
+          "required": ["start_date", "end_date"],
+          "additionalProperties": false,
+          "properties": {"start_date": {"type": "string"}, "end_date": {"type": "string"}}
+        },
+        "date_windows": {"type": "integer"},
+        "raw_dir": {"type": "string"},
+        "total_found": {"$ref": "#/$defs/int", "description": "Records matching in PubMed"},
+        "max_results": {"type": "integer"},
+        "expected": {"$ref": "#/$defs/int", "description": "Records this run tried to retrieve"},
+        "retrieved": {"type": "integer", "description": "Records retrieved in this run"},
+        "skipped_records": {"type": "integer", "description": "Records that could not be parsed"},
+        "skipped_existing": {"type": "integer", "description": "Records skipped by --resume"},
+        "truncated": {"type": "boolean", "description": "True if max_results or PubMed's limit cut the results"},
+        "complete": {"type": "boolean", "description": "False if any batch failed"},
+        "failed_batches": {"type": "array", "items": {"type": "object"}},
+        "fulltext_lookup_failures": {"type": "integer"},
+        "icite_lookup_failures": {"type": "integer"},
+        "downloads": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"downloaded": {"type": "integer"}, "failed": {"type": "integer"}}
+        },
+        "total_articles": {"type": "integer", "description": "Articles in the output (after merge/resume)"}
+      }
+    },
+    "author": {
+      "type": "object",
+      "required": ["position", "name", "last_name", "fore_name", "initials", "collective_name", "orcid", "affiliations"],
+      "additionalProperties": false,
+      "properties": {
+        "position": {"type": "integer", "minimum": 1},
+        "name": {"type": "string"},
+        "last_name": {"$ref": "#/$defs/str"},
+        "fore_name": {"$ref": "#/$defs/str"},
+        "initials": {"$ref": "#/$defs/str"},
+        "collective_name": {"$ref": "#/$defs/str"},
+        "orcid": {"type": ["string", "null"], "pattern": "^\\d{4}-\\d{4}-\\d{4}-\\d{3}[\\dX]$"},
+        "affiliations": {"$ref": "#/$defs/strings"}
+      }
+    },
+    "mesh": {
+      "type": "object",
+      "required": ["descriptor", "ui", "major_topic", "qualifiers"],
+      "additionalProperties": false,
+      "properties": {
+        "descriptor": {"type": "string"},
+        "ui": {"$ref": "#/$defs/str"},
+        "major_topic": {"type": "boolean"},
+        "qualifiers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "ui", "major_topic"],
+            "additionalProperties": false,
+            "properties": {
+              "name": {"type": "string"},
+              "ui": {"$ref": "#/$defs/str"},
+              "major_topic": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "fulltext": {
+      "type": ["object", "null"],
+      "required": ["url", "source", "access_type", "oa_checked", "license", "is_manuscript", "retracted", "download_links"],
+      "additionalProperties": false,
+      "properties": {
+        "url": {"type": "string"},
+        "source": {"enum": ["PMC", "NCBI Bookshelf", "Publisher (via DOI)"]},
+        "access_type": {"enum": ["open", "free", "unknown"]},
+        "oa_checked": {"type": "boolean", "description": "False if the PMC open-access lookup failed"},
+        "license": {"$ref": "#/$defs/str"},
+        "is_manuscript": {"$ref": "#/$defs/bool"},
+        "retracted": {"$ref": "#/$defs/bool"},
+        "download_links": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["format", "url", "path"],
+            "additionalProperties": false,
+            "properties": {
+              "format": {"enum": ["pdf", "xml", "txt"]},
+              "url": {"type": "string"},
+              "path": {"$ref": "#/$defs/str"}
+            }
+          }
+        }
+      }
+    },
+    "metrics": {
+      "type": ["object", "null"],
+      "required": ["source"],
+      "additionalProperties": false,
+      "properties": {
+        "source": {"const": "icite"},
+        "citation_count": {"$ref": "#/$defs/int"},
+        "relative_citation_ratio": {"$ref": "#/$defs/num"},
+        "nih_percentile": {"$ref": "#/$defs/num"},
+        "field_citation_rate": {"$ref": "#/$defs/num"},
+        "expected_citations_per_year": {"$ref": "#/$defs/num"},
+        "citations_per_year": {"$ref": "#/$defs/num"},
+        "apt": {"$ref": "#/$defs/num"},
+        "is_clinical": {"$ref": "#/$defs/bool"},
+        "is_research_article": {"$ref": "#/$defs/bool"}
+      }
+    },
+    "article": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_type", "pmid", "url", "title", "abstract", "abstract_sections", "authors", "authors_display",
+        "journal", "journal_abbrev", "issn", "issn_linking", "volume", "issue", "pages", "book_title", "publisher",
+        "date", "year", "month", "day", "date_precision", "date_raw", "epub_date",
+        "languages", "publication_types", "publication_status", "mesh", "mesh_terms", "keywords", "grants",
+        "article_ids", "doi", "pmc_id", "comments_corrections", "is_retracted", "fulltext", "metrics"
+      ],
+      "properties": {
+        "record_type": {"enum": ["journal_article", "book"]},
+        "pmid": {"type": "string", "pattern": "^\\d+$"},
+        "url": {"type": "string"},
+        "title": {"$ref": "#/$defs/str"},
+        "abstract": {"$ref": "#/$defs/str", "description": "Sections joined as 'LABEL: text'"},
+        "abstract_sections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["label", "category", "text"],
+            "additionalProperties": false,
+            "properties": {"label": {"$ref": "#/$defs/str"}, "category": {"$ref": "#/$defs/str"}, "text": {"type": "string"}}
+          }
+        },
+        "authors": {"type": "array", "items": {"$ref": "#/$defs/author"}},
+        "authors_display": {"type": "string"},
+        "journal": {"$ref": "#/$defs/str"},
+        "journal_abbrev": {"$ref": "#/$defs/str"},
+        "issn": {"$ref": "#/$defs/str"},
+        "issn_linking": {"$ref": "#/$defs/str"},
+        "volume": {"$ref": "#/$defs/str"},
+        "issue": {"$ref": "#/$defs/str"},
+        "pages": {"$ref": "#/$defs/str"},
+        "book_title": {"$ref": "#/$defs/str"},
+        "publisher": {"$ref": "#/$defs/str"},
+        "date": {"$ref": "#/$defs/date", "description": "Issue/publication date, as precise as known"},
+        "year": {"$ref": "#/$defs/int"},
+        "month": {"type": ["integer", "null"], "minimum": 1, "maximum": 12},
+        "day": {"type": ["integer", "null"], "minimum": 1, "maximum": 31},
+        "date_precision": {"enum": ["day", "month", "year", null]},
+        "date_raw": {"$ref": "#/$defs/str", "description": "Original text for seasons and date ranges"},
+        "epub_date": {"$ref": "#/$defs/date", "description": "Electronic publication date (books: contribution date)"},
+        "languages": {"$ref": "#/$defs/strings"},
+        "publication_types": {"$ref": "#/$defs/strings"},
+        "publication_status": {"$ref": "#/$defs/str"},
+        "mesh": {"type": "array", "items": {"$ref": "#/$defs/mesh"}},
+        "mesh_terms": {"$ref": "#/$defs/strings"},
+        "keywords": {"$ref": "#/$defs/strings"},
+        "grants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["grant_id", "acronym", "agency", "country"],
+            "additionalProperties": false,
+            "properties": {
+              "grant_id": {"$ref": "#/$defs/str"},
+              "acronym": {"$ref": "#/$defs/str"},
+              "agency": {"$ref": "#/$defs/str"},
+              "country": {"$ref": "#/$defs/str"}
+            }
+          }
+        },
+        "article_ids": {"type": "object", "additionalProperties": {"type": "string"}},
+        "doi": {"$ref": "#/$defs/str"},
+        "pmc_id": {"$ref": "#/$defs/str"},
+        "comments_corrections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type", "pmid", "source"],
+            "additionalProperties": false,
+            "properties": {"type": {"$ref": "#/$defs/str"}, "pmid": {"$ref": "#/$defs/str"}, "source": {"$ref": "#/$defs/str"}}
+          }
+        },
+        "is_retracted": {"type": "boolean"},
+        "fulltext": {"$ref": "#/$defs/fulltext"},
+        "metrics": {"$ref": "#/$defs/metrics"}
+      }
+    }
+  }
+}

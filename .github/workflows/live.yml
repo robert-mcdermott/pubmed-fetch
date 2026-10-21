@@ -1,0 +1,28 @@
+name: Live API checks
+
+# Weekly contract tests against the real NCBI E-utilities, PMC Cloud Service and iCite APIs,
+# to catch upstream changes (like the 2026 PMC OA Web Service retirement) early.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+      - name: Live tests
+        run: uv run -m pytest -q -m live tests/test_live.py
+        env:
+          PUBMED_FETCH_LIVE: "1"
+          # Optional repository secret; raises NCBI's rate limit.
+          NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}

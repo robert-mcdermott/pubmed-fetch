@@ -1,21 +1,24 @@
 [project]
 name = "pubmed-fetch"
-version = "0.2.0"
-description = "Search PubMed by MeSH terms, authors and affiliations and export articles with abstracts and PMC full-text links to JSON"
+version = "0.3.0"
+description = "Search PubMed by MeSH terms, authors, affiliations and more; export structured records with abstracts, PMC full-text links and citation metrics"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
     "requests>=2.32.4",
 ]
 
 [project.scripts]
-pubmed-fetch = "pubmed_fetch:main_cli"
+pubmed-fetch = "pubmed_fetch.cli:main_cli"
 
 [project.optional-dependencies]
 # Developer tools installed with: uv sync --extra dev
 dev = [
+    "jsonschema>=4.25",
+    "mypy>=2.4",
     "pytest>=8.3",
     "ruff>=0.5.0",
+    "types-requests>=2.33",
 ]
 
 [build-system]
@@ -23,15 +26,21 @@ requires = ["hatchling>=1.27,<2"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["pubmed_fetch.py"]
+packages = ["src/pubmed_fetch"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+markers = ["live: tests that call the real NCBI/PMC/iCite APIs (run with PUBMED_FETCH_LIVE=1)"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+check_untyped_defs = true
+warn_unused_ignores = true
 
 [tool.ruff]
 # Target Python version used for linting/formatting
-target-version = "py313"
+target-version = "py310"
 line-length = 120
 
 [tool.ruff.lint]

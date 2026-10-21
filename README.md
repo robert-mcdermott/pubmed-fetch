@@ -1,150 +1,167 @@
 # PubMed Fetch
 
-A simple CLI to search PubMed (NCBI E-utilities) for recent articles by MeSH terms, authors and/or affiliations and export structured JSON with full abstracts and full-text availability from PubMed Central (PMC).
+A CLI and Python library that searches PubMed (NCBI E-utilities) and exports structured, schema-versioned records — abstracts, authors with affiliations and ORCIDs, MeSH terms with qualifiers, grants, retraction status, PubMed Central (PMC) full-text availability and optional citation metrics — as JSON, JSONL, CSV or SQLite, ready for downstream analysis.
 
 ## Requirements
-- Python 3.13 (see .python-version)
+- Python 3.10+ (development uses 3.13, see .python-version)
 - uv package manager
 
-## Install dependencies
+## Install
 ```bash
 uv sync
 ```
-This also installs a `pubmed-fetch` command, so `uv run pubmed-fetch ...` and `uv run pubmed_fetch.py ...` are equivalent.
+This installs the `pubmed-fetch` command: run it with `uv run pubmed-fetch ...` (or `uv run -m pubmed_fetch ...`). To install it globally: `uv tool install .`
 
 ## Quick start
 ```bash
-# Single MeSH term (last 30 days, custom output file)
-uv run pubmed_fetch.py --mesh-terms "Breast Neoplasms" --days 30 --output breast-cancer-articles.json
+# MeSH terms, last 30 days
+uv run pubmed-fetch --mesh-terms "Endometrial Neoplasms" "Ovarian Neoplasms" --days 30 --output gyn.json
 
-# Multiple MeSH terms (space-separated)
-uv run pubmed_fetch.py --mesh-terms "Endometrial Neoplasms" "Ovarian Neoplasms" --days 30 --output gyn-cancers.json
+# Author in an absolute date range, as CSV (format inferred from the extension)
+uv run pubmed-fetch --author "Smith J" --start-date 2024-01-01 --end-date 2024-12-31 --output smith-2024.csv
 
-# Search by author (field-tagged as [Author])
-uv run pubmed_fetch.py --author "Smith J" --days 30 --max-results 100
+# Combine filters: OR within a filter, AND across filters
+uv run pubmed-fetch --mesh-terms "Breast Neoplasms" --author "Smith J" "Lee K" --organization "NIH" --days 90
 
-# Search by organization/affiliation (field-tagged as [Affiliation])
-uv run pubmed_fetch.py --organization "FRED HUTCHINSON CANCER CENTER" --days 365
+# Raw PubMed syntax, exclusions, journal and publication-type filters
+uv run pubmed-fetch --query 'crispr[tiab] AND humans[mh]' --journal Nature Science --exclude 'Review[pt]' --output crispr.jsonl
 
-# Combine filters: AND across categories, OR within each category
-uv run pubmed_fetch.py --mesh-terms "Breast Neoplasms" --author "Smith J" "Lee K" --organization "NIH" --days 90 --max-results 50 --email you@example.com
+# Weekly monitoring into a SQLite database (only articles added since the last run)
+uv run pubmed-fetch --mesh-terms "Ovarian Neoplasms" --since-last-run ovarian.state.json --output ovarian.sqlite
 
-# Absolute date range, saved as CSV (format inferred from the extension)
-uv run pubmed_fetch.py --author "Smith J" --start-date 2024-01-01 --end-date 2024-12-31 --output smith-2024.csv
+# Fetch known PMIDs with citation metrics and pipe the JSON to another tool
+uv run pubmed-fetch --pmids pmids.txt --icite --output - -q | jq '.articles[] | {pmid, title, rcr: .metrics.relative_citation_ratio}'
 
-# Download open-access PDFs and XML into ./papers
-uv run pubmed_fetch.py --mesh-terms "Ovarian Neoplasms" --days 7 --download-fulltext papers --download-formats pdf xml
+# Download open-access PDFs and XML
+uv run pubmed-fetch --mesh-terms "Ovarian Neoplasms" --days 7 --download-fulltext papers --download-formats pdf xml
 ```
 
-## Using a config file (INI)
-An INI file can specify search parameters under a [search] section. See sample_config.ini for an example.
-```ini
-[search]
-# MeSH terms (optional; comma-separated)
-mesh_terms = Endometrial Neoplasms, Ovarian Neoplasms
+## Searching
+| Option | PubMed field |
+| --- | --- |
+| `--mesh-terms` | `[MeSH Terms]` (includes narrower terms; `--mesh-noexp` for exact) |
+| `--author` | `[Author]` |
+| `--organization` | `[Affiliation]` |
+| `--title-abstract` | `[Title/Abstract]` |
+| `--journal` | `[Journal]` |
+| `--publication-type` | `[Publication Type]` |
+| `--language` | `[Language]` |
+| `--query` | raw PubMed syntax, ANDed with the filters |
+| `--exclude` | raw expressions removed with `NOT` |
 
-# Author filters (optional; comma-separated; e.g., Lastname Initials)
-authors = Sanders S, Smith J
+Values are quoted, so multi-word values match as phrases. The query PubMed actually ran is recorded in `search_info.query_translation`.
 
-# Organization/Affiliation filters (optional; comma-separated)
-organizations = FRED HUTCHINSON CANCER CENTER
+**Typos are reported.** If PubMed doesn't recognize a term (e.g. a misspelled MeSH heading) or a field tag, a warning is printed and stored in `search_info.query_warnings`. With `--strict`, the run fails instead.
 
-days = 30
-# start_date = 2024-01-01
-# end_date = 2024-12-31
-max_results = 1000
-output_file = pubmed_articles.json
-# format = csv
-# download_dir = papers
-# download_formats = pdf, xml
-email = you@example.com
-# api_key = your-ncbi-api-key
-```
-Run with a config file:
-```bash
-uv run pubmed_fetch.py --config sample_config.ini
-```
-Generate a starter config (will not overwrite an existing file):
-```bash
-uv run pubmed_fetch.py --create-config my_config.ini
-```
+**Dates.** `--days N` (default 30) counts back from `--end-date` (default today); `--start-date` gives an absolute range. `--date-type` chooses which date is filtered:
+- `pdat` (default): publication date. Note that articles can be indexed weeks after their publication date and some carry future issue dates.
+- `edat`: the date the record was added to PubMed. Use this for monitoring "what's new".
+- `mdat`: last modification date.
 
-Precedence: command-line options > environment variables (`NCBI_EMAIL`, `NCBI_API_KEY`) > config file > defaults.
+**Large result sets.** PubMed returns at most 10,000 records per search. When more match and `--max-results` allows, the date range is split automatically into windows that each fit, so all records can be retrieved (except on a single day with more than 10,000 matches, which is reported).
 
-## Arguments (from --help)
-- --mesh-terms: one or more MeSH terms (space-separated). Optional if using other filters.
-- --author: one or more author names (space-separated), matched with the [Author] field.
-- --organization: one or more organization/affiliation names (space-separated), matched with the [Affiliation] field.
-- --days: number of days before the end date to include (default 30)
-- --start-date / --end-date: absolute publication date range as YYYY-MM-DD (end defaults to today; `--start-date` can't be combined with `--days`)
-- --max-results: cap on articles to fetch (default 1000; PubMed will not return more than 10,000)
-- --output: output filename (default `pubmed_articles.<format>`); a `.json`, `.jsonl` or `.csv` extension selects the format
-- --format: `json` (default), `jsonl` or `csv`; overrides the extension
-- --email: contact email for NCBI (recommended; or `NCBI_EMAIL`)
-- --api-key: NCBI API key, raises the rate limit from 3 to 10 requests/second (or `NCBI_API_KEY`)
-- --no-fulltext: skip the PMC full-text availability check
-- --download-fulltext DIR: download available PMC full-text files into DIR (existing files are skipped, so re-runs resume)
-- --download-formats: any of `pdf`, `xml`, `txt` (default `pdf`)
-- --config: INI config path
-- --create-config: write a sample INI to the given filename
-- -q/--quiet: only print warnings and errors (no result listing); -v/--verbose: debug output
-
-Semantics: OR within a category (e.g., multiple authors), AND across categories (e.g., authors AND MeSH). Terms are quoted, so multi-word values are matched as phrases.
-
-Progress and diagnostics go to stderr; the result listing goes to stdout. The exit code is non-zero if the search fails.
+## Inputs other than a search
+- `--pmids FILE`: fetch specific PMIDs (whitespace/comma separated, `#` comments allowed; `-` reads stdin).
+- `--save-raw DIR`: also save the raw PubMed XML (gzipped) for every batch.
+- `--from-raw DIR`: re-parse saved XML without contacting PubMed, e.g. after upgrading pubmed-fetch.
 
 ## Output
-Formats:
-- `json`: a single document with `search_info` and `articles` (described below)
-- `jsonl`: one article object per line, convenient for streaming and `jq`
-- `csv`: one row per article; list fields (authors, MeSH terms, keywords, publication types) are joined with `; `, and the full-text URL, access type and license are flattened into columns
+`--output FILE` (or `-` for stdout); the format comes from `--format` or the extension:
 
-JSON output contains:
-- `search_info`: query, mesh_terms, authors, organizations, date_range, total_found (matches in PubMed), total_articles (retrieved), generated_on
-- `articles`: pmid, title, authors, authors_display, journal, date (`YYYY-MM-DD` when available), abstract, mesh_terms, keywords, publication_types, doi, pmc_id, url, fulltext
+| Format | Extension | Notes |
+| --- | --- | --- |
+| `json` | `.json` | One document: `schema_version`, `search_info`, `articles`. Written atomically at the end. |
+| `jsonl` | `.jsonl`, `.ndjson` | One article per line, written as batches arrive. |
+| `csv` | `.csv` | One flattened row per article; lists joined with `; `. Written as batches arrive. |
+| `sqlite` | `.sqlite`, `.db` | Normalized tables (below). Records are upserted by PMID, so repeated runs accumulate. |
 
-`fulltext.access_type` is one of:
-- `open`: in the PMC Open Access Subset; includes `license` and `download_links` (pdf/xml/txt) from the [PMC Cloud Service](https://pmc.ncbi.nlm.nih.gov/tools/pmcaws/)
-- `free`: in PMC and free to read, but not in the Open Access Subset (author manuscripts may still have a `TDM` license and download links)
+Updating existing output:
+- `--merge`: update an existing file, replacing records with the same PMID (json, jsonl, csv).
+- `--resume`: continue an interrupted run, skipping PMIDs already in the output and appending the rest (jsonl, csv, sqlite, json).
+
+`--summary FILE` writes the run's `search_info` as JSON (`-` for stdout), which is handy for orchestration tools.
+
+Progress and diagnostics go to stderr. The human-readable listing goes to stdout unless `-q` is given or the data itself is written to stdout.
+
+### Exit codes
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Error (bad options, search failed, nothing could be fetched) |
+| 2 | Partial results: some batches failed. Output is written with `search_info.complete = false` and details in `search_info.failed_batches`. `--since-last-run` state is not advanced, so the next run retries. |
+
+### Record format (schema version 2)
+The JSON Schema is in [`src/pubmed_fetch/schema/output.schema.json`](src/pubmed_fetch/schema/output.schema.json) (article records are `$defs/article`) and is available in Python via `pubmed_fetch.schema.load_schema()`. Missing values are `null`, never placeholder strings.
+
+Each article includes:
+- Identification: `pmid`, `record_type` (`journal_article` or `book`), `url`, `doi`, `pmc_id`, `article_ids` (all IDs PubMed lists for the record)
+- Content: `title`, `abstract`, `abstract_sections` (`label`, `category`, `text`), `keywords`, `languages`, `publication_types`
+- People: `authors` (`position`, `name`, `last_name`, `fore_name`, `initials`, `collective_name`, `orcid`, `affiliations`), `authors_display`
+- Source: `journal`, `journal_abbrev`, `issn`, `issn_linking`, `volume`, `issue`, `pages`, `book_title`, `publisher`
+- Dates: `date` (ISO, as precise as known: `2024`, `2024-02` or `2024-02-05`), `year`, `month`, `day`, `date_precision`, `date_raw` (seasons and ranges such as `1998 Winter`, `2023 Jan-Feb`), `epub_date`, `publication_status`
+- Indexing: `mesh` (`descriptor`, `ui`, `major_topic`, `qualifiers`), `mesh_terms` (descriptor names), `grants` (`grant_id`, `acronym`, `agency`, `country`)
+- Corrections: `comments_corrections` (`type` such as `RetractionIn` or `ErratumFor`, `pmid`, `source`), `is_retracted`
+- `fulltext` (or `null`): `url`, `source` (`PMC`, `NCBI Bookshelf`, `Publisher (via DOI)`), `access_type`, `oa_checked`, `license`, `is_manuscript`, `retracted`, `download_links` (`format`, `url`, `path`)
+- `metrics` (with `--icite`, else `null`): `citation_count`, `relative_citation_ratio`, `nih_percentile`, `field_citation_rate`, `expected_citations_per_year`, `citations_per_year`, `apt`, `is_clinical`, `is_research_article`. Very recent articles aren't in iCite yet and get `null`.
+
+`fulltext.access_type`:
+- `open`: in the PMC Open Access Subset; `license` and `download_links` come from the [PMC Cloud Service](https://pmc.ncbi.nlm.nih.gov/tools/pmcaws/)
+- `free`: free to read (in PMC but not in the Open Access Subset, or NCBI Bookshelf). If `oa_checked` is false, the open-access lookup failed.
 - `unknown`: not in PMC; a DOI link to the publisher is provided
 
-With `--download-fulltext`, each downloaded entry in `download_links` also gets a `path` to the local file. Files come from the PMC Article Datasets on AWS, which are licensed for reuse; check each article's `license` before redistributing.
+`search_info` records provenance and completeness: `tool` (name, version), `generated_on` (UTC), `source` (`search`, `pmids` or `raw`), `query`, `query_translation`, `query_warnings`, `filters`, `date_type`, `date_range`, `date_windows`, `total_found`, `max_results`, `expected`, `retrieved`, `truncated`, `complete`, `failed_batches`, `skipped_records`, `skipped_existing`, lookup failure counts, and `total_articles`.
+
+### SQLite tables
+`articles` (one row per PMID, including `record_json` with the full record), `authors`, `affiliations`, `mesh` (one row per descriptor/qualifier pair), `keywords`, `publication_types`, `grants`, and `runs` (the `search_info` of every run). For example:
+```sql
+SELECT m.descriptor, COUNT(*) FROM mesh m JOIN articles a USING (pmid)
+WHERE a.year >= 2024 AND m.descriptor_major GROUP BY 1 ORDER BY 2 DESC LIMIT 10;
+```
+
+## Incremental runs
+`--since-last-run STATE` starts from the end date stored in the STATE file (or from `--days` on the first run), then updates the file after a complete run. It uses the Entrez date (`edat`) unless `--date-type` is given. Runs overlap by one day so nothing indexed late is missed; use SQLite output, `--merge` or `--resume` to de-duplicate.
+
+## Using a config file (INI)
+All options can go in a `[search]` section; see [sample_config.ini](sample_config.ini), or generate one with `uv run pubmed-fetch --create-config my_config.ini` (it won't overwrite an existing file). Lists are comma-separated and/or one per line; quote values that contain commas (common in MeSH terms):
+```ini
+[search]
+mesh_terms = "Carcinoma, Ductal, Breast", Breast Neoplasms
+journals =
+    Nature
+    Science
+date_type = edat
+icite = yes
+output_file = results.sqlite
+```
+Unknown keys are reported, so typos don't go unnoticed. Precedence: command line > environment (`NCBI_EMAIL`, `NCBI_API_KEY`) > config file > defaults.
+
+## Library use
+```python
+from pubmed_fetch import Options, PubMedClient, QuerySpec, run
+
+# Full pipeline, same as the CLI
+result = run(Options(spec=QuerySpec(mesh_terms=["Breast Neoplasms"]), days=7, output_file="out.jsonl", display=False))
+print(result.exit_code, result.search_info["total_articles"])
+
+# Records in memory, streamed in batches
+client = PubMedClient(email="you@example.com")
+for batch in client.iter_pmids(["28298962", "35187501"]):
+    for article in batch:
+        print(article["pmid"], article["title"])
+```
+The package doesn't configure logging; it logs to the `pubmed_fetch` logger.
 
 ## Notes
-- Requests are rate limited to NCBI's limits and retried with backoff on 429/5xx errors.
-- PubMed searches use the E-utilities history server and fetch records in batches of 200.
-- The PMC OA Web Service was retired by NCBI in August 2026; open-access status now comes from the PMC Article Datasets on AWS.
+- Provide a real email via `--email` or `NCBI_EMAIL`, as NCBI requests. An [NCBI API key](https://support.nlm.nih.gov/kbArticle/?pn=KA-05317) raises the rate limit from 3 to 10 requests/second.
+- Requests are rate limited and retried with backoff on 429/5xx errors; efetch batches are retried once more because NCBI's history server sometimes returns transient 400 errors.
+- Downloaded files come from the PMC Article Datasets on AWS, which are licensed for reuse; check each article's `license` before redistributing.
+- See [CHANGELOG.md](CHANGELOG.md) for changes between versions, including the 0.3.0 output-format changes.
 
-## Testing
-GitHub Actions (`.github/workflows/ci.yml`) runs ruff lint, the ruff format check and pytest on pushes to `main`/`v2` and on pull requests.
-
-Install dev dependencies (pytest, ruff):
+## Development
 ```bash
-uv sync --extra dev
+uv sync --extra dev          # pytest, ruff, mypy, jsonschema
+uv run -m pytest -q          # unit tests (offline, use real PubMed XML fixtures in tests/fixtures)
+PUBMED_FETCH_LIVE=1 uv run -m pytest -q -m live   # contract tests against the real APIs
+uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
-Run all tests (they don't make network calls):
-```bash
-uv run -m pytest -q
-```
-Run a single test file:
-```bash
-uv run -m pytest tests/test_pubmed_fetch.py -q
-```
-Run a single test case:
-```bash
-uv run -m pytest tests/test_pubmed_fetch.py::test_build_query_and_params -q
-```
-
-## Linting and formatting (Ruff)
-Run lint checks:
-```bash
-uv run ruff check .
-```
-Auto-fix simple issues:
-```bash
-uv run ruff check . --fix
-```
-Format code:
-```bash
-uv run ruff format .
-```
+GitHub Actions runs lint, type checks and tests on Python 3.10-3.13 for every push and pull request (`.github/workflows/ci.yml`), and the live API tests weekly (`.github/workflows/live.yml`; add an `NCBI_API_KEY` repository secret to use a key).
