@@ -242,6 +242,63 @@ for batch in client.iter_pmids(["28298962", "35187501"]):
 ```
 The package doesn't configure logging; it logs to the `pubmed_fetch` logger.
 
+## Using pubmed-fetch from AI coding agents (agent skill)
+[`skills/pubmed-fetch/`](skills/pubmed-fetch/) is an agent skill in the open [Agent Skills](https://agentskills.io) format, which Claude Code, OpenAI Codex, Gemini CLI, GitHub Copilot, Cursor, Devin and other coding agents support. It teaches an agent to use this tool well:
+- run it, with no install needed
+- check the result count and catch misspelled MeSH terms before collecting
+- turn requests into the right filters
+- pick an output format and confirm the results are complete
+- read results with `jq`/`sqlite3` instead of loading whole files
+
+`SKILL.md` holds the workflow and worked examples; `reference.md` holds the record fields, SQLite tables and example queries, and is loaded only when needed.
+
+**Requirements:** the agent must be able to run shell commands, with [uv](https://docs.astral.sh/uv/) installed and network access to NCBI. The skill runs the tool with `uvx --from git+https://github.com/robert-mcdermott/pubmed-fetch pubmed-fetch` when it isn't installed, so users don't need to install pubmed-fetch first. `jq` and `sqlite3` are used for reading results.
+
+### Install with a skills installer
+Either of these copies the skill into the right folder for the agents you choose, at project or personal scope:
+```bash
+# skills CLI (Node.js 18+); supports Claude Code, Codex, Cursor, Copilot, Gemini CLI and more
+npx skills add robert-mcdermott/pubmed-fetch
+
+# GitHub CLI (skill support is in preview); see `gh skill install --help` for --agent and --scope
+gh skill install robert-mcdermott/pubmed-fetch pubmed-fetch
+```
+
+### Install manually
+Copy (or symlink) the `skills/pubmed-fetch` folder into a skills folder your agent reads:
+
+| Agent | Project (commit it to share with a team) | Personal (all your projects) |
+| --- | --- | --- |
+| Claude Code | `.claude/skills/` | `~/.claude/skills/` |
+| OpenAI Codex | `.agents/skills/` | `~/.agents/skills/` |
+| Gemini CLI | `.agents/skills/` or `.gemini/skills/` | `~/.agents/skills/` or `~/.gemini/skills/` |
+| GitHub Copilot | `.github/skills/`, `.agents/skills/` or `.claude/skills/` | `~/.agents/skills/` or `~/.copilot/skills/` |
+| Devin | `.agents/skills/` or `.devin/skills/` | `~/.agents/skills/` or `~/.config/devin/skills/` |
+| Cursor, Cline, OpenCode, Amp, Warp and others | `.agents/skills/` | see the agent's documentation |
+
+`~/.agents/skills/` is the shared location: one copy there covers every agent above except Claude Code. For example:
+```bash
+git clone https://github.com/robert-mcdermott/pubmed-fetch.git
+mkdir -p ~/.agents/skills ~/.claude/skills
+cp -r pubmed-fetch/skills/pubmed-fetch ~/.agents/skills/   # Codex, Gemini CLI, Copilot, Devin, Cursor, ...
+cp -r pubmed-fetch/skills/pubmed-fetch ~/.claude/skills/   # Claude Code
+```
+To pick up updates with `git pull`, use a symlink instead of a copy, e.g. `ln -s "$PWD/pubmed-fetch/skills/pubmed-fetch" ~/.agents/skills/pubmed-fetch`. Codex documents symlink support; if your agent doesn't follow symlinks, copy the folder instead. Gemini CLI loads project-level skills only in folders you've marked as trusted (`/trust`). Restart the agent, or reload its skills, after installing.
+
+### Use it
+Ask in plain language, and the agent loads the skill when the request matches its description:
+> Find randomized controlled trials on ovarian cancer published in 2025, excluding reviews, and summarize the most cited ones.
+
+> Build a SQLite database of breast cancer papers from 2024 with citation metrics, then show the top journals and funders.
+
+> Here are three PMIDs: 28298962, 35187501, 36452530. Summarize them and flag any retractions.
+
+You can also invoke it by name: `/pubmed-fetch` in Claude Code and Devin, or `$pubmed-fetch` in Codex.
+
+Agents ask before running shell commands. To skip those prompts, allow commands that start with `uvx --from git+https://github.com/robert-mcdermott/pubmed-fetch pubmed-fetch` (or `pubmed-fetch` / `uv run pubmed-fetch`), `jq` and `sqlite3` in your agent's permission settings.
+
+For an agent without skill support, point it at the file instead, e.g. "Read `skills/pubmed-fetch/SKILL.md` and follow it to search PubMed for …", or paste the contents into its instructions file (such as `AGENTS.md`).
+
 ## Notes
 - Provide a real email via `--email` or `NCBI_EMAIL`, as NCBI requests. An [NCBI API key](https://support.nlm.nih.gov/kbArticle/?pn=KA-05317) raises the rate limit from 3 to 10 requests/second.
 - Requests are rate limited and retried with backoff on 429/5xx errors; efetch batches are retried once more because NCBI's history server sometimes returns transient 400 errors.
@@ -255,4 +312,6 @@ uv run -m pytest -q          # unit tests (offline, use real PubMed XML fixtures
 PUBMED_FETCH_LIVE=1 uv run -m pytest -q -m live   # contract tests against the real APIs
 uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
+When CLI options or the output change, update the agent skill in `skills/pubmed-fetch/` to match.
+
 GitHub Actions runs lint, type checks and tests on Python 3.10-3.13 for every push and pull request (`.github/workflows/ci.yml`), and the live API tests weekly (`.github/workflows/live.yml`; add an `NCBI_API_KEY` repository secret to use a key).

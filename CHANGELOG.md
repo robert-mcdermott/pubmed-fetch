@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Agent skill for AI coding agents (Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, Devin, …) in `skills/pubmed-fetch/`, following the Agent Skills standard. See "Using pubmed-fetch from AI coding agents" in the README.
+
 ## 0.3.0
 
 ### Breaking changes

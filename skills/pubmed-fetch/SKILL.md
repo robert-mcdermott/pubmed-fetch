@@ -7,18 +7,6 @@ description: >-
   citation metrics; export JSON/JSONL/CSV/SQLite; monitor a topic over time. Use when the user asks
   about PubMed, MEDLINE, PMIDs, MeSH, biomedical/medical papers, literature searches or reviews,
   publication trends, citations, or building a literature dataset.
-argument-hint: "[what to search for]"
-allowed-tools:
-  - read
-  - grep
-  - glob
-permissions:
-  allow:
-    - Exec(uv run pubmed-fetch)
-    - Exec(uvx --from git+https://github.com/robert-mcdermott/pubmed-fetch pubmed-fetch)
-    - Exec(pubmed-fetch)
-    - Exec(jq)
-    - Exec(sqlite3)
 ---
 
 # pubmed-fetch
