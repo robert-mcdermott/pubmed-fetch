@@ -1,12 +1,15 @@
 [project]
-name = "pubmed-search"
-version = "0.1.0"
-description = "Add your description here"
+name = "pubmed-fetch"
+version = "0.2.0"
+description = "Search PubMed by MeSH terms, authors and affiliations and export articles with abstracts and PMC full-text links to JSON"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "requests>=2.32.4",
 ]
+
+[project.scripts]
+pubmed-fetch = "pubmed_fetch:main_cli"
 
 [project.optional-dependencies]
 # Developer tools installed with: uv sync --extra dev
@@ -15,14 +18,24 @@ dev = [
     "ruff>=0.5.0",
 ]
 
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["pubmed_fetch.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
 [tool.ruff]
 # Target Python version used for linting/formatting
 target-version = "py313"
 line-length = 120
 
 [tool.ruff.lint]
-# Use default rule set; configure ignores here if needed
-select = ["E", "F", "W"]
+select = ["E", "F", "W", "I", "B", "UP"]
 
 [tool.ruff.format]
 quote-style = "double"

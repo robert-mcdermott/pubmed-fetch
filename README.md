@@ -1,6 +1,6 @@
 # PubMed Fetch
 
-A simple CLI to search PubMed (NCBI E-utilities) for recent articles by MeSH terms and export structured JSON, including basic full-text link detection (PMC/DOI).
+A simple CLI to search PubMed (NCBI E-utilities) for recent articles by MeSH terms, authors and/or affiliations and export structured JSON with full abstracts and full-text availability from PubMed Central (PMC).
 
 ## Requirements
 - Python 3.13 (see .python-version)
@@ -10,6 +10,7 @@ A simple CLI to search PubMed (NCBI E-utilities) for recent articles by MeSH ter
 ```bash
 uv sync
 ```
+This also installs a `pubmed-fetch` command, so `uv run pubmed-fetch ...` and `uv run pubmed_fetch.py ...` are equivalent.
 
 ## Quick start
 ```bash
@@ -20,7 +21,7 @@ uv run pubmed_fetch.py --mesh-terms "Breast Neoplasms" --days 30 --output breast
 uv run pubmed_fetch.py --mesh-terms "Endometrial Neoplasms" "Ovarian Neoplasms" --days 30 --output gyn-cancers.json
 
 # Search by author (field-tagged as [Author])
-uv run pubmed_fetch.py --author "Joe Smith" --days 30 --max-results 100
+uv run pubmed_fetch.py --author "Smith J" --days 30 --max-results 100
 
 # Search by organization/affiliation (field-tagged as [Affiliation])
 uv run pubmed_fetch.py --organization "FRED HUTCHINSON CANCER CENTER" --days 365
@@ -30,7 +31,7 @@ uv run pubmed_fetch.py --mesh-terms "Breast Neoplasms" --author "Smith J" "Lee K
 ```
 
 ## Using a config file (INI)
-An INI file can specify search parameters under a [search] section. See test_config.ini for an example.
+An INI file can specify search parameters under a [search] section. See sample_config.ini for an example.
 ```ini
 [search]
 # MeSH terms (optional; comma-separated)
@@ -40,48 +41,64 @@ mesh_terms = Endometrial Neoplasms, Ovarian Neoplasms
 authors = Sanders S, Smith J
 
 # Organization/Affiliation filters (optional; comma-separated)
-organizations = FRED HUTCHINSON CANCER CENTER 
+organizations = FRED HUTCHINSON CANCER CENTER
 
 days = 30
 max_results = 1000
 output_file = pubmed_articles.json
 email = you@example.com
+# api_key = your-ncbi-api-key
 ```
 Run with a config file:
 ```bash
-uv run pubmed_fetch.py --config test_config.ini
+uv run pubmed_fetch.py --config sample_config.ini
 ```
-Generate a starter config:
+Generate a starter config (will not overwrite an existing file):
 ```bash
 uv run pubmed_fetch.py --create-config my_config.ini
 ```
+
+Precedence: command-line options > environment variables (`NCBI_EMAIL`, `NCBI_API_KEY`) > config file > defaults.
 
 ## Arguments (from --help)
 - --mesh-terms: one or more MeSH terms (space-separated). Optional if using other filters.
 - --author: one or more author names (space-separated), matched with the [Author] field.
 - --organization: one or more organization/affiliation names (space-separated), matched with the [Affiliation] field.
 - --days: past N days to include (default 30)
-- --max-results: cap on PMIDs to fetch (default 1000)
+- --max-results: cap on articles to fetch (default 1000; PubMed will not return more than 10,000)
 - --output: output JSON filename (default pubmed_articles.json)
-- --email: contact email for NCBI (recommended)
+- --email: contact email for NCBI (recommended; or `NCBI_EMAIL`)
+- --api-key: NCBI API key, raises the rate limit from 3 to 10 requests/second (or `NCBI_API_KEY`)
+- --no-fulltext: skip the PMC full-text availability check
 - --config: INI config path
 - --create-config: write a sample INI to the given filename
+- -q/--quiet: only print warnings and errors (no result listing); -v/--verbose: debug output
 
-Semantics: OR within a category (e.g., multiple authors), AND across categories (e.g., authors AND MeSH).
+Semantics: OR within a category (e.g., multiple authors), AND across categories (e.g., authors AND MeSH). Terms are quoted, so multi-word values are matched as phrases.
+
+Progress and diagnostics go to stderr; the result listing goes to stdout. The exit code is non-zero if the search fails.
 
 ## Output
-Writes JSON with search_info (terms, generated_on, date_range, total_articles) and an articles array including: pmid, title, authors, journal, date, abstract, MeSH terms, doi, pmc_id, url, and fulltext (if detected).
+Writes JSON with:
+- `search_info`: query, mesh_terms, authors, organizations, date_range, total_found (matches in PubMed), total_articles (retrieved), generated_on
+- `articles`: pmid, title, authors, authors_display, journal, date (`YYYY-MM-DD` when available), abstract, mesh_terms, keywords, publication_types, doi, pmc_id, url, fulltext
+
+`fulltext.access_type` is one of:
+- `open`: in the PMC Open Access Subset; includes `license` and `download_links` (pdf/xml/txt) from the [PMC Cloud Service](https://pmc.ncbi.nlm.nih.gov/tools/pmcaws/)
+- `free`: in PMC and free to read, but not in the Open Access Subset (author manuscripts may still have a `TDM` license and download links)
+- `unknown`: not in PMC; a DOI link to the publisher is provided
 
 ## Notes
-- The tool respects NCBI rate limits with brief sleeps for batch requests and PMC OA checks.
-- Provide a real email via --email or config for courteous API usage.
+- Requests are rate limited to NCBI's limits and retried with backoff on 429/5xx errors.
+- PubMed searches use the E-utilities history server and fetch records in batches of 200.
+- The PMC OA Web Service was retired by NCBI in August 2026; open-access status now comes from the PMC Article Datasets on AWS.
 
 ## Testing
 Install dev dependencies (pytest, ruff):
 ```bash
 uv sync --extra dev
 ```
-Run all tests:
+Run all tests (they don't make network calls):
 ```bash
 uv run -m pytest -q
 ```

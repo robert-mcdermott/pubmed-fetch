@@ -2,30 +2,163 @@
 """
 PubMed Search Utility
 
-A flexible utility to search PubMed for articles with specified MeSH terms
-published within a specified time range using the NCBI E-utilities API.
-Results are saved in JSON format with full abstracts.
+Search PubMed (NCBI E-utilities) for articles matching MeSH terms, authors and/or
+organizations within a recent publication-date window. Results are saved as JSON
+with full abstracts and full-text availability from PubMed Central.
 
 Usage:
-    python pubmed_endometrial_search.py --mesh-terms "Endometrial Neoplasms" "Ovarian Neoplasms" --days 30
-    python pubmed_endometrial_search.py --config config.ini
+    uv run pubmed_fetch.py --mesh-terms "Endometrial Neoplasms" "Ovarian Neoplasms" --days 30
+    uv run pubmed_fetch.py --config config.ini
 """
 
-import requests
-import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
-import time
-import sys
-import json
 import argparse
 import configparser
+import json
+import logging
 import os
+import sys
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+log = logging.getLogger("pubmed_fetch")
+
+EUTILS_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+PMC_S3_BUCKET_URL = "https://pmc-oa-opendata.s3.amazonaws.com/"
+S3_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+# PubMed's E-utilities will not return records beyond the first 10,000 of a search.
+PUBMED_RECORD_LIMIT = 10_000
+
+DEFAULTS = {
+    "mesh_terms": [],
+    "authors": [],
+    "organizations": [],
+    "days": 30,
+    "max_results": 1000,
+    "output_file": "pubmed_articles.json",
+    "email": None,
+    "api_key": None,
+}
+
+MONTHS = {
+    m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)
+}
+
+
+class PubMedError(Exception):
+    """Raised when PubMed cannot be queried or returns an error."""
+
+
+def _text(elem):
+    """Return all text inside an element, including text in inline markup such as <i> or <sup>."""
+    return "".join(elem.itertext()).strip() if elem is not None else ""
+
+
+def _make_session(pool_size=10):
+    retry = Retry(
+        total=4,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET", "POST"}),
+        respect_retry_after_header=True,
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=pool_size))
+    return session
+
+
+def _quote(term):
+    return '"' + term.replace('"', "").strip() + '"'
+
+
+def build_query(mesh_terms=None, authors=None, organizations=None):
+    """Build a PubMed query: OR within each category, AND across categories."""
+    groups = [
+        (mesh_terms, "MeSH Terms"),
+        (authors, "Author"),
+        (organizations, "Affiliation"),
+    ]
+    subqueries = ["(" + " OR ".join(f"{_quote(t)}[{tag}]" for t in terms) + ")" for terms, tag in groups if terms]
+    return " AND ".join(subqueries)
+
+
+def _normalize_pmcid(pmc_id):
+    return pmc_id if pmc_id.upper().startswith("PMC") else f"PMC{pmc_id}"
+
+
+def _s3_to_https(url):
+    """Convert an s3://pmc-oa-opendata/... URL into a public HTTPS URL."""
+    path = url.split("?", 1)[0].removeprefix("s3://pmc-oa-opendata/")
+    return PMC_S3_BUCKET_URL + path
+
+
+def _format_pub_date(pub_date):
+    if pub_date is None:
+        return "N/A"
+    year = _text(pub_date.find("Year"))
+    if not year:
+        return _text(pub_date.find("MedlineDate")) or "N/A"
+    month = _text(pub_date.find("Month"))
+    month_num = MONTHS.get(month[:3].lower()) or (int(month) if month.isdigit() else None)
+    if not month_num:
+        return year
+    day = _text(pub_date.find("Day"))
+    return f"{year}-{month_num:02d}" + (f"-{int(day):02d}" if day.isdigit() else "")
+
+
+def _author_name(author):
+    last, fore = _text(author.find("LastName")), _text(author.find("ForeName"))
+    if last:
+        return f"{last}, {fore}" if fore else last
+    return _text(author.find("CollectiveName"))
+
 
 class PubMedSearcher:
-    def __init__(self):
-        self.base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
-        self.tool = "gynecologic_neoplasms_search_script"
-        self.email = "user@example.com"  # Replace with your email
+    batch_size = 200
+    fulltext_workers = 8
+
+    def __init__(self, email=None, api_key=None, tool="pubmed-fetch", session=None, timeout=30):
+        self.base_url = EUTILS_URL
+        self.tool = tool
+        self.email = email
+        self.api_key = api_key
+        self.timeout = timeout
+        self.session = session or _make_session(self.fulltext_workers)
+        self.search_info = {}
+        self._last_request = 0.0
+
+    @property
+    def min_interval(self):
+        # NCBI allows 3 requests/second without an API key and 10/second with one.
+        return 0.1 if self.api_key else 0.34
+
+    def _eutils(self, endpoint, params):
+        """Make a rate-limited E-utilities request and return the parsed XML root."""
+        params = {**params, "tool": self.tool}
+        if self.email:
+            params["email"] = self.email
+        if self.api_key:
+            params["api_key"] = self.api_key
+
+        wait = self._last_request + self.min_interval - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            response = self.session.post(f"{self.base_url}{endpoint}", data=params, timeout=self.timeout)
+        finally:
+            self._last_request = time.monotonic()
+        response.raise_for_status()
+
+        root = ET.fromstring(response.content)
+        error = root.find("ERROR")
+        if error is not None:
+            raise PubMedError(_text(error))
+        return root
 
     def search_pubmed(self, mesh_terms=None, authors=None, organizations=None, days_back=30, max_results=1000):
         """
@@ -34,527 +167,322 @@ class PubMedSearcher:
         - authors (list of strings; matched with [Author])
         - organizations/affiliations (list of strings; matched with [Affiliation])
         and restrict to a publication date window.
+
+        Returns a list of article dicts. Details of the search are stored in ``self.search_info``.
+        Raises PubMedError if the search itself fails.
         """
-        # Calculate date range
+        search_term = build_query(mesh_terms, authors, organizations)
+        if not search_term:
+            raise PubMedError(
+                "No search terms provided. Specify at least one of --mesh-terms, --author, --organization."
+            )
+
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days_back)
 
-        # Format dates for PubMed API (YYYY/MM/DD)
-        start_date_str = start_date.strftime("%Y/%m/%d")
-        end_date_str = end_date.strftime("%Y/%m/%d")
+        log.info("Search query: %s", search_term)
+        log.info("Date range: %s to %s", start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
 
-        # Build category-specific subqueries (OR within a category)
-        subqueries = []
-        mesh_terms = mesh_terms or []
-        authors = authors or []
-        organizations = organizations or []
+        try:
+            root = self._eutils(
+                "esearch.fcgi",
+                {
+                    "db": "pubmed",
+                    "term": search_term,
+                    "datetype": "pdat",
+                    "mindate": start_date.strftime("%Y/%m/%d"),
+                    "maxdate": end_date.strftime("%Y/%m/%d"),
+                    "usehistory": "y",
+                    "retmax": 0,
+                },
+            )
+        except (requests.RequestException, ET.ParseError) as e:
+            raise PubMedError(f"Error searching PubMed: {e}") from e
 
-        if mesh_terms:
-            mesh_queries = [f"{term}[MeSH Terms]" for term in mesh_terms]
-            subqueries.append("(" + " OR ".join(mesh_queries) + ")")
-        if authors:
-            author_queries = [f"{a}[Author]" for a in authors]
-            subqueries.append("(" + " OR ".join(author_queries) + ")")
-        if organizations:
-            org_queries = [f"{org}[Affiliation]" for org in organizations]
-            subqueries.append("(" + " OR ".join(org_queries) + ")")
+        total_count = int(_text(root.find("Count")) or 0)
+        webenv, query_key = _text(root.find("WebEnv")), _text(root.find("QueryKey"))
 
-        if not subqueries:
-            print("Error: No search terms provided. Specify at least one of --mesh-terms, --author, or --organization.")
-            return []
-
-        # AND across categories
-        search_term = " AND ".join(subqueries)
-
-        # E-search parameters
-        search_params = {
-            'db': 'pubmed',
-            'term': search_term,
-            'datetype': 'pdat',  # Publication date
-            'mindate': start_date_str,
-            'maxdate': end_date_str,
-            'usehistory': 'y',
-            'retmax': max_results,
-            'tool': self.tool,
-            'email': self.email
+        self.search_info = {
+            "query": search_term,
+            "mesh_terms": list(mesh_terms or []),
+            "authors": list(authors or []),
+            "organizations": list(organizations or []),
+            "date_range": {"start_date": start_date.strftime("%Y-%m-%d"), "end_date": end_date.strftime("%Y-%m-%d")},
+            "total_found": total_count,
         }
 
-        display_parts = []
-        if mesh_terms:
-            display_parts.append("MeSH: " + ", ".join(mesh_terms))
-        if authors:
-            display_parts.append("Authors: " + ", ".join(authors))
-        if organizations:
-            display_parts.append("Orgs: " + ", ".join(organizations))
-        print(f"Searching PubMed for: {' | '.join(display_parts)}")
-        print(f"Search query: {search_term}")
-        print(f"Date range: {start_date_str} to {end_date_str}")
-        print("=" * 50)
-
-        try:
-            # Perform search
-            search_url = f"{self.base_url}esearch.fcgi"
-            response = requests.get(search_url, params=search_params)
-            response.raise_for_status()
-
-            # Parse XML response
-            root = ET.fromstring(response.content)
-
-            # Extract PMIDs
-            pmids = []
-            for id_elem in root.findall('.//Id'):
-                pmids.append(id_elem.text)
-
-            # Get count
-            count_elem = root.find('.//Count')
-            total_count = int(count_elem.text) if count_elem is not None else 0
-
-            print(f"Found {total_count} articles")
-
-            if pmids:
-                return self.fetch_article_details(pmids)
-            else:
-                return []
-
-        except requests.RequestException as e:
-            print(f"Error searching PubMed: {e}")
+        log.info("Found %d articles", total_count)
+        to_fetch = min(total_count, max_results, PUBMED_RECORD_LIMIT)
+        if to_fetch < total_count:
+            log.warning(
+                "Only the first %d of %d matching articles will be retrieved "
+                "(raise --max-results or narrow the search to get the rest; PubMed's limit is %d).",
+                to_fetch,
+                total_count,
+                PUBMED_RECORD_LIMIT,
+            )
+        if not to_fetch:
             return []
-        except ET.ParseError as e:
-            print(f"Error parsing XML response: {e}")
-            return []
+        return self._efetch_batches(
+            [
+                {
+                    "WebEnv": webenv,
+                    "query_key": query_key,
+                    "retstart": start,
+                    "retmax": min(self.batch_size, to_fetch - start),
+                }
+                for start in range(0, to_fetch, self.batch_size)
+            ]
+        )
 
     def fetch_article_details(self, pmids):
-        """
-        Fetch detailed information for articles using PMIDs in batches
-        """
-        if not pmids:
-            return []
+        """Fetch detailed information for a list of PMIDs, in batches."""
+        return self._efetch_batches(
+            [{"id": ",".join(pmids[i : i + self.batch_size])} for i in range(0, len(pmids), self.batch_size)]
+        )
 
-        print(f"Fetching details for {len(pmids)} articles...")
-
-        all_articles = []
-        batch_size = 200  # Process in smaller batches
-
-        for i in range(0, len(pmids), batch_size):
-            batch_pmids = pmids[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            total_batches = (len(pmids) + batch_size - 1) // batch_size
-
-            print(f"Processing batch {batch_num}/{total_batches} ({len(batch_pmids)} articles)...")
-
-            # E-fetch parameters
-            fetch_params = {
-                'db': 'pubmed',
-                'id': ','.join(batch_pmids),
-                'retmode': 'xml',
-                'tool': self.tool,
-                'email': self.email
-            }
-
+    def _efetch_batches(self, batches):
+        articles = []
+        for num, params in enumerate(batches, 1):
+            log.info("Fetching batch %d/%d...", num, len(batches))
             try:
-                # Add delay to be respectful to NCBI servers
-                time.sleep(1)
-
-                fetch_url = f"{self.base_url}efetch.fcgi"
-                response = requests.get(fetch_url, params=fetch_params)
-                response.raise_for_status()
-
-                # Parse XML response
-                root = ET.fromstring(response.content)
-
-                batch_articles = []
-                for article in root.findall('.//PubmedArticle'):
-                    article_info = self.parse_article(article)
-                    if article_info:
-                        batch_articles.append(article_info)
-
-                all_articles.extend(batch_articles)
-                print(f"Retrieved {len(batch_articles)} articles from batch {batch_num}")
-
-            except requests.RequestException as e:
-                print(f"Error fetching batch {batch_num}: {e}")
+                root = self._eutils("efetch.fcgi", {"db": "pubmed", "retmode": "xml", **params})
+            except (requests.RequestException, ET.ParseError, PubMedError) as e:
+                log.warning("Batch %d/%d failed and was skipped: %s", num, len(batches), e)
                 continue
-            except ET.ParseError as e:
-                print(f"Error parsing batch {batch_num}: {e}")
-                continue
-
-        print(f"Total articles retrieved: {len(all_articles)}")
-        return all_articles
+            articles.extend(a for a in map(self.parse_article, root.iter("PubmedArticle")) if a)
+        log.info("Total articles retrieved: %d", len(articles))
+        return articles
 
     def parse_article(self, article_xml):
-        """
-        Parse individual article XML to extract relevant information
-        """
-        try:
-            # Extract PMID
-            pmid_elem = article_xml.find('.//PMID')
-            pmid = pmid_elem.text if pmid_elem is not None else "N/A"
-
-            # Extract title
-            title_elem = article_xml.find('.//ArticleTitle')
-            title = title_elem.text if title_elem is not None else "N/A"
-
-            # Extract authors
-            authors = []
-            for author in article_xml.findall('.//Author'):
-                lastname = author.find('LastName')
-                forename = author.find('ForeName')
-                if lastname is not None and forename is not None:
-                    authors.append(f"{lastname.text}, {forename.text}")
-                elif lastname is not None:
-                    authors.append(lastname.text)
-
-            author_str = "; ".join(authors[:5])  # Limit to first 5 authors
-            if len(authors) > 5:
-                author_str += " et al."
-
-            # Extract journal
-            journal_elem = article_xml.find('.//Journal/Title')
-            journal = journal_elem.text if journal_elem is not None else "N/A"
-
-            # Extract publication date
-            pub_date = article_xml.find('.//PubDate')
-            date_str = "N/A"
-            if pub_date is not None:
-                year = pub_date.find('Year')
-                month = pub_date.find('Month')
-                day = pub_date.find('Day')
-
-                if year is not None:
-                    date_str = year.text
-                    if month is not None:
-                        date_str += f"-{month.text}"
-                        if day is not None:
-                            date_str += f"-{day.text}"
-
-            # Extract full abstract
-            abstract_elements = article_xml.findall('.//Abstract/AbstractText')
-            abstract = ""
-            if abstract_elements:
-                abstract_parts = []
-                for elem in abstract_elements:
-                    # Handle structured abstracts with labels
-                    label = elem.get('Label', '')
-                    text = elem.text or ''
-                    if label:
-                        abstract_parts.append(f"{label}: {text}")
-                    else:
-                        abstract_parts.append(text)
-                abstract = " ".join(abstract_parts).strip()
-
-            # Extract MeSH terms
-            mesh_terms = []
-            for mesh_heading in article_xml.findall('.//MeshHeading'):
-                descriptor = mesh_heading.find('DescriptorName')
-                if descriptor is not None:
-                    mesh_terms.append(descriptor.text)
-
-            # Extract DOI if available
-            doi = ""
-            for article_id in article_xml.findall('.//ArticleId'):
-                if article_id.get('IdType') == 'doi':
-                    doi = article_id.text
-                    break
-
-            # Extract PMC ID if available
-            pmc_id = ""
-            for article_id in article_xml.findall('.//ArticleId'):
-                if article_id.get('IdType') == 'pmc':
-                    pmc_id = article_id.text
-                    break
-
-            return {
-                'pmid': pmid,
-                'title': title,
-                'authors': authors,  # Return full list instead of truncated string
-                'authors_display': author_str,  # Keep display version
-                'journal': journal,
-                'date': date_str,
-                'abstract': abstract,
-                'mesh_terms': mesh_terms,
-                'doi': doi,
-                'pmc_id': pmc_id,
-                'url': f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-                'fulltext': None
-            }
-
-        except Exception as e:
-            print(f"Error parsing article: {e}")
+        """Parse a <PubmedArticle> element into a dict."""
+        citation = article_xml.find("MedlineCitation")
+        article = citation.find("Article") if citation is not None else None
+        if article is None:
+            log.warning("Skipping malformed PubmedArticle record")
             return None
+
+        pmid = _text(citation.find("PMID")) or "N/A"
+        authors = [name for a in article.findall("AuthorList/Author") if (name := _author_name(a))]
+        author_str = "; ".join(authors[:5]) + (" et al." if len(authors) > 5 else "")
+
+        abstract_parts = []
+        for elem in article.findall("Abstract/AbstractText"):
+            label, text = elem.get("Label", ""), _text(elem)
+            abstract_parts.append(f"{label}: {text}" if label else text)
+
+        # Only use the article's own IDs, not those of cited references in PubmedData/ReferenceList.
+        ids = {}
+        for id_elem in article_xml.findall("PubmedData/ArticleIdList/ArticleId"):
+            ids.setdefault(id_elem.get("IdType"), _text(id_elem))
+        doi = ids.get("doi") or next(
+            (_text(e) for e in article.findall("ELocationID") if e.get("EIdType") == "doi"),
+            "",
+        )
+
+        return {
+            "pmid": pmid,
+            "title": _text(article.find("ArticleTitle")) or "N/A",
+            "authors": authors,
+            "authors_display": author_str,
+            "journal": _text(article.find("Journal/Title")) or "N/A",
+            "date": _format_pub_date(article.find("Journal/JournalIssue/PubDate")),
+            "abstract": " ".join(p for p in abstract_parts if p),
+            "mesh_terms": [_text(d) for d in citation.findall("MeshHeadingList/MeshHeading/DescriptorName")],
+            "keywords": [_text(k) for k in citation.findall("KeywordList/Keyword") if _text(k)],
+            "publication_types": [_text(p) for p in article.findall("PublicationTypeList/PublicationType")],
+            "doi": doi,
+            "pmc_id": ids.get("pmc", ""),
+            "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+            "fulltext": None,
+        }
 
     def add_fulltext_info(self, articles):
         """
-        Add full-text availability information for all articles
+        Add full-text availability information.
+
+        Articles in PubMed Central are free to read ("free"). Those in the PMC Open Access
+        Subset ("open") are identified, with license and download links, through the PMC
+        Cloud Service on AWS. Other articles get a DOI link with unknown access.
         """
         if not articles:
             return articles
 
-        print(f"Checking full-text availability for {len(articles)} articles...")
-
-        # Initialize fulltext info for all articles
+        log.info("Checking full-text availability for %d articles...", len(articles))
+        pmc_articles = []
         for article in articles:
-            article['fulltext'] = None
-
-        # Handle articles with PMC IDs
-        articles_with_pmc = [article for article in articles if article.get('pmc_id')]
-
-        if articles_with_pmc:
-            # Add PMC links for articles with PMC IDs
-            for article in articles_with_pmc:
-                pmc_id = article['pmc_id']
-
-                # Ensure PMC ID has proper format
-                if not pmc_id.startswith('PMC'):
-                    pmc_id = f"PMC{pmc_id}"
-
-                article['fulltext'] = {
-                    'url': f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmc_id}/",
-                    'source': 'PMC',
-                    'access_type': 'unknown'  # Will be updated if we can determine
+            article["fulltext"] = None
+            if article.get("pmc_id"):
+                pmcid = _normalize_pmcid(article["pmc_id"])
+                article["fulltext"] = {
+                    "url": f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/",
+                    "source": "PMC",
+                    "access_type": "free",
+                }
+                pmc_articles.append(article)
+            elif article.get("doi"):
+                article["fulltext"] = {
+                    "url": f"https://doi.org/{article['doi']}",
+                    "source": "Publisher (via DOI)",
+                    "access_type": "unknown",
                 }
 
-            # Check PMC Open Access status in batches
-            self._check_pmc_open_access_status(articles_with_pmc)
+        failures = 0
+        with ThreadPoolExecutor(max_workers=self.fulltext_workers) as pool:
+            pmcids = [_normalize_pmcid(a["pmc_id"]) for a in pmc_articles]
+            for article, result in zip(pmc_articles, pool.map(self._pmc_dataset_metadata, pmcids), strict=True):
+                if isinstance(result, Exception):
+                    failures += 1
+                    log.debug("PMC dataset lookup failed for %s: %s", article["pmc_id"], result)
+                elif result:
+                    self._apply_pmc_metadata(article["fulltext"], result)
+        if failures:
+            log.warning("Could not check open-access status for %d PMC articles.", failures)
 
-        # Check for other full-text sources (publisher websites, etc.)
-        self._check_other_fulltext_sources(articles)
-
-        fulltext_count = sum(1 for article in articles if article.get('fulltext'))
-        open_access_count = sum(
-            1
-            for article in articles
-            if article.get('fulltext') and article['fulltext'].get('access_type') == 'open'
-        )
-
-        print(
-            f"Full-text links found for {fulltext_count} articles "
-            f"({open_access_count} open access)."
-        )
-
+        fulltext_count = sum(1 for a in articles if a["fulltext"])
+        open_count = sum(1 for a in articles if a["fulltext"] and a["fulltext"]["access_type"] == "open")
+        log.info("Full-text links found for %d articles (%d open access).", fulltext_count, open_count)
         return articles
 
-    def _check_pmc_open_access_status(self, articles_with_pmc):
+    def _pmc_dataset_metadata(self, pmcid):
         """
-        Check PMC Open Access status for articles with PMC IDs
-        """
-        batch_size = 50
-        for i in range(0, len(articles_with_pmc), batch_size):
-            batch = articles_with_pmc[i:i + batch_size]
-            pmc_ids = [article['pmc_id'] for article in batch]
-
-            try:
-                # Format PMC IDs for OA service
-                formatted_ids = []
-                for pmc_id in pmc_ids:
-                    if pmc_id.startswith('PMC'):
-                        formatted_ids.append(pmc_id[3:])
-                    else:
-                        formatted_ids.append(pmc_id)
-
-                oa_url = "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi"
-                params = {
-                    'id': ','.join(formatted_ids),
-                    'tool': self.tool,
-                    'email': self.email
-                }
-
-                time.sleep(0.5)  # Be respectful to the API
-                response = requests.get(oa_url, params=params)
-                response.raise_for_status()
-
-                # Parse XML response
-                root = ET.fromstring(response.content)
-
-                # Check for Open Access records
-                for record in root.findall('.//record'):
-                    pmc_id_elem = record.get('id')
-                    if not pmc_id_elem:
-                        continue
-
-                    # Find corresponding article
-                    for article in batch:
-                        article_pmc_id = article['pmc_id']
-                        if article_pmc_id.startswith('PMC'):
-                            article_pmc_id = article_pmc_id[3:]
-
-                        if article_pmc_id == pmc_id_elem:
-                            # Extract license and download links
-                            license_type = record.get('license', 'unknown')
-
-                            download_links = []
-                            for link in record.findall('.//link'):
-                                link_format = link.get('format', '')
-                                link_url = link.get('href', '')
-                                if link_url:
-                                    download_links.append({
-                                        'format': link_format,
-                                        'url': link_url
-                                    })
-
-                            # Update fulltext info
-                            article['fulltext']['access_type'] = 'open'
-                            article['fulltext']['license'] = license_type
-                            if download_links:
-                                article['fulltext']['download_links'] = download_links
-                            break
-
-                # Mark remaining PMC articles as closed access
-                for article in batch:
-                    if article['fulltext']['access_type'] == 'unknown':
-                        article['fulltext']['access_type'] = 'closed'
-
-            except Exception:
-                # If we can't check, leave as unknown
-                for article in batch:
-                    if article['fulltext']['access_type'] == 'unknown':
-                        article['fulltext']['access_type'] = 'unknown'
-                continue
-
-    def _check_other_fulltext_sources(self, articles):
-        """
-        Check for other full-text sources for articles without PMC IDs
-        """
-        # For articles without PMC IDs, check if DOI links to open access
-        for article in articles:
-            if not article.get('fulltext') and article.get('doi'):
-                # Create a DOI link - many are open access
-                doi_url = f"https://doi.org/{article['doi']}"
-                article['fulltext'] = {
-                    'url': doi_url,
-                    'source': 'Publisher (via DOI)',
-                    'access_type': 'unknown'  # Would need additional API calls to determine
-                }
-
-    def display_results(self, articles, mesh_terms, days_back=30):
-        """
-        Display search results in a formatted way
-        """
-        if not articles:
-            print("No articles found.")
-            return
-
-        mesh_display = mesh_terms if isinstance(mesh_terms, list) else [mesh_terms]
-        mesh_header = ", ".join(mesh_display)
-        print(
-            f"\nFound {len(articles)} articles with MeSH tags: {mesh_header} "
-            f"(past {days_back} days)"
-        )
-        print("=" * 80)
-
-        for i, article in enumerate(articles, 1):
-            print(f"\n{i}. {article['title']}")
-            print(f"   Authors: {article['authors_display']}")
-            print(f"   Journal: {article['journal']}")
-            print(f"   Date: {article['date']}")
-            print(f"   PMID: {article['pmid']}")
-            print(f"   URL: {article['url']}")
-            if article['mesh_terms']:
-                mesh_list = ", ".join(article['mesh_terms'][:5])
-                suffix = "..." if len(article['mesh_terms']) > 5 else ""
-                print(f"   MeSH Terms: {mesh_list}{suffix}")
-            if article['abstract']:
-                is_long = len(article['abstract']) > 200
-                abstract_preview = article['abstract'][:200] + "..." if is_long else article['abstract']
-                print(f"   Abstract: {abstract_preview}")
-            if article.get('pmc_id'):
-                print(f"   PMC ID: {article['pmc_id']}")
-            if article.get('fulltext'):
-                access_indicator = ""
-                if article['fulltext']['access_type'] == 'open':
-                    access_indicator = " [Open Access]"
-                elif article['fulltext']['access_type'] == 'closed':
-                    access_indicator = " [Closed Access]"
-
-                print(f"   Full-text: {article['fulltext']['url']}{access_indicator}")
-
-                if 'download_links' in article['fulltext']:
-                    formats = [link['format'] for link in article['fulltext']['download_links']]
-                    print(f"   Downloads: {', '.join(formats)} available")
-            print("-" * 40)
-
-    def save_to_json(self, articles, mesh_terms, filename="pubmed_articles.json", days_back=30):
-        """
-        Save results to a JSON file
+        Look up an article in the PMC Article Datasets (S3) and return its JSON metadata,
+        or None if it is not part of the datasets. Exceptions are returned, not raised.
         """
         try:
-            mesh_display = mesh_terms if isinstance(mesh_terms, list) else [mesh_terms]
+            response = self.session.get(
+                PMC_S3_BUCKET_URL,
+                params={"list-type": "2", "prefix": f"{pmcid}.", "delimiter": "/"},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            versions = [_text(p).rstrip("/") for p in root.findall("s3:CommonPrefixes/s3:Prefix", S3_NS)]
+            metadata = []
+            for version in versions:
+                meta_response = self.session.get(f"{PMC_S3_BUCKET_URL}metadata/{version}.json", timeout=self.timeout)
+                meta_response.raise_for_status()
+                metadata.append(meta_response.json())
+        except (requests.RequestException, ET.ParseError, ValueError) as e:
+            return e
+        if not metadata:
+            return None
+        # Prefer an open-access, final published version; otherwise the latest version.
+        return max(
+            metadata,
+            key=lambda m: (bool(m.get("is_pmc_openaccess")), not m.get("is_manuscript"), m.get("version") or 0),
+        )
 
-            data = {
-                "search_info": {
-                    "mesh_terms": mesh_display,
-                    "generated_on": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "date_range": {
-                        "start_date": (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d'),
-                        "end_date": datetime.now().strftime('%Y-%m-%d')
-                    },
-                    "total_articles": len(articles)
-                },
-                "articles": articles
-            }
+    @staticmethod
+    def _apply_pmc_metadata(fulltext, meta):
+        fulltext["access_type"] = "open" if meta.get("is_pmc_openaccess") else "free"
+        if meta.get("license_code"):
+            fulltext["license"] = meta["license_code"]
+        if meta.get("is_retracted"):
+            fulltext["retracted"] = True
+        links = [
+            {"format": fmt, "url": _s3_to_https(meta[key])}
+            for fmt, key in (("pdf", "pdf_url"), ("xml", "xml_url"), ("txt", "text_url"))
+            if meta.get(key)
+        ]
+        if links:
+            fulltext["download_links"] = links
 
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+    def display_results(self, articles, out=None):
+        """Print search results in a human-readable format."""
+        out = out or sys.stdout
+        if not articles:
+            print("No articles found.", file=out)
+            return
 
-            print(f"\nResults saved to: {filename}")
+        print(f"\nRetrieved {len(articles)} articles", file=out)
+        print("=" * 80, file=out)
+        for i, article in enumerate(articles, 1):
+            lines = [
+                f"\n{i}. {article['title']}",
+                f"   Authors: {article['authors_display']}",
+                f"   Journal: {article['journal']}",
+                f"   Date: {article['date']}",
+                f"   PMID: {article['pmid']}",
+                f"   URL: {article['url']}",
+            ]
+            if article["mesh_terms"]:
+                suffix = "..." if len(article["mesh_terms"]) > 5 else ""
+                lines.append(f"   MeSH Terms: {', '.join(article['mesh_terms'][:5])}{suffix}")
+            if article["abstract"]:
+                abstract = article["abstract"]
+                lines.append(f"   Abstract: {abstract[:200] + '...' if len(abstract) > 200 else abstract}")
+            if article.get("pmc_id"):
+                lines.append(f"   PMC ID: {article['pmc_id']}")
+            fulltext = article.get("fulltext")
+            if fulltext:
+                indicator = {
+                    "open": f" [Open Access{', ' + fulltext['license'] if fulltext.get('license') else ''}]",
+                    "free": " [Free in PMC]",
+                }.get(fulltext["access_type"], "")
+                if fulltext.get("retracted"):
+                    indicator += " [RETRACTED]"
+                lines.append(f"   Full-text: {fulltext['url']}{indicator}")
+                if fulltext.get("download_links"):
+                    formats = ", ".join(link["format"] for link in fulltext["download_links"])
+                    lines.append(f"   Downloads: {formats} available")
+            lines.append("-" * 40)
+            print("\n".join(lines), file=out)
 
-        except Exception as e:
-            print(f"Error saving to file: {e}")
+    def save_to_json(self, articles, filename="pubmed_articles.json"):
+        """Save results, together with details of the search, to a JSON file."""
+        data = {
+            "search_info": {
+                **self.search_info,
+                "generated_on": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "total_articles": len(articles),
+            },
+            "articles": articles,
+        }
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        log.info("Results saved to: %s", filename)
+
+
+def _split_list(value):
+    return [item.strip() for item in value.split(",") if item.strip()]
+
 
 def load_config(config_file):
     """
-    Load configuration from INI file
+    Load settings from the [search] section of an INI file.
+    Only keys present in the file are returned, so callers can layer CLI > config > defaults.
     """
     config = configparser.ConfigParser()
     config.read(config_file)
+    if "search" not in config:
+        return {}
+    section = config["search"]
 
-    # Default section
-    search_config = {
-        'mesh_terms': [],
-        'authors': [],
-        'organizations': [],
-        'days': 30,
-        'max_results': 1000,
-        'output_file': 'pubmed_articles.json',
-        'email': 'user@example.com'
-    }
+    settings = {}
+    for key in ("mesh_terms", "authors", "organizations"):
+        if key in section:
+            settings[key] = _split_list(section[key])
+    for key in ("days", "max_results"):
+        if key in section:
+            settings[key] = section.getint(key)
+    for key in ("output_file", "email", "api_key"):
+        if section.get(key, "").strip():
+            settings[key] = section[key].strip()
+    return settings
 
-    if 'search' in config:
-        section = config['search']
 
-        # Parse mesh terms (comma-separated)
-        if 'mesh_terms' in section:
-            mesh_terms_str = section['mesh_terms']
-            search_config['mesh_terms'] = [term.strip() for term in mesh_terms_str.split(',') if term.strip()]
-        # Parse authors (comma-separated)
-        if 'authors' in section:
-            authors_str = section['authors']
-            search_config['authors'] = [a.strip() for a in authors_str.split(',') if a.strip()]
-        # Parse organizations (comma-separated)
-        if 'organizations' in section:
-            orgs_str = section['organizations']
-            search_config['organizations'] = [o.strip() for o in orgs_str.split(',') if o.strip()]
+def _positive_int(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
+    return number
 
-        # Parse other settings
-        if 'days' in section:
-            search_config['days'] = section.getint('days')
 
-        if 'max_results' in section:
-            search_config['max_results'] = section.getint('max_results')
-
-        if 'output_file' in section:
-            search_config['output_file'] = section['output_file']
-
-        if 'email' in section:
-            search_config['email'] = section['email']
-
-    return search_config
-
-def parse_arguments():
-    """
-    Parse command-line arguments
-    """
+def parse_arguments(argv=None):
+    """Parse command-line arguments. Unset options are None so config values can apply."""
     parser = argparse.ArgumentParser(
-        description='Search PubMed for articles with specified filters (MeSH terms, authors, organizations)',
+        description="Search PubMed for articles with specified filters (MeSH terms, authors, organizations)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -563,78 +491,51 @@ Examples:
   %(prog)s --organization "Harvard Medical School" --days 365
   %(prog)s --mesh-terms "Breast Neoplasms" --author "Smith J" --days 7 --output results.json
   %(prog)s --config config.ini
-        """
-    )
 
-    parser.add_argument(
-        '--mesh-terms',
-        nargs='+',
-        help='MeSH terms to search for (space-separated)'
+Environment variables:
+  NCBI_EMAIL, NCBI_API_KEY  used when --email / --api-key are not given
+        """,
     )
+    parser.add_argument("--mesh-terms", nargs="+", help="MeSH terms to search for (space-separated)")
     parser.add_argument(
-        '--author',
-        nargs='+',
-        help='Author name(s) to search for (e.g., "Gilbert P"). Space-separated for multiple.'
+        "--author",
+        nargs="+",
+        help='Author name(s) to search for (e.g., "Gilbert P"). Space-separated for multiple.',
     )
     parser.add_argument(
-        '--organization',
-        nargs='+',
-        help=(
-            'Organization/Affiliation name(s) to search for (e.g., "Harvard Medical School"). '
-            'Space-separated for multiple.'
-        )
+        "--organization",
+        nargs="+",
+        help='Organization/Affiliation name(s) (e.g., "Harvard Medical School"). Space-separated for multiple.',
     )
-
     parser.add_argument(
-        '--days',
-        type=int,
-        default=30,
-        help='Number of past days to include in search (default: 30)'
+        "--days", type=_positive_int, help=f"Number of past days to include in search (default: {DEFAULTS['days']})"
     )
-
     parser.add_argument(
-        '--max-results',
-        type=int,
-        default=1000,
-        help='Maximum number of results to fetch (default: 1000)'
+        "--max-results",
+        type=_positive_int,
+        help=f"Maximum number of results to fetch (default: {DEFAULTS['max_results']}, PubMed limit: 10000)",
     )
-
-    parser.add_argument(
-        '--output',
-        help='Output JSON filename (default: pubmed_articles.json)'
-    )
-
-    parser.add_argument(
-        '--email',
-        help='Your email address for NCBI API (recommended)'
-    )
-
-    parser.add_argument(
-        '--config',
-        help='Configuration file (INI format)'
-    )
-
-    parser.add_argument(
-        '--create-config',
-        help='Create a sample configuration file'
-    )
+    parser.add_argument("--output", help=f"Output JSON filename (default: {DEFAULTS['output_file']})")
+    parser.add_argument("--email", help="Your email address for NCBI API (recommended)")
+    parser.add_argument("--api-key", help="NCBI API key; raises the rate limit from 3 to 10 requests/second")
+    parser.add_argument("--no-fulltext", action="store_true", help="Skip the PMC full-text availability check")
+    parser.add_argument("--config", help="Configuration file (INI format)")
+    parser.add_argument("--create-config", metavar="FILENAME", help="Create a sample configuration file and exit")
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument("-q", "--quiet", action="store_true", help="Only print warnings and errors")
+    verbosity.add_argument("-v", "--verbose", action="store_true", help="Print debug output")
+    return parser.parse_args(argv)
 
 
-    return parser.parse_args()
-
-def create_sample_config(filename):
-    """
-    Create a sample configuration file
-    """
-    config_content = """[search]
+SAMPLE_CONFIG = """[search]
 # MeSH terms to search for (comma-separated)
 mesh_terms = Endometrial Neoplasms, Ovarian Neoplasms
 
 # Authors to filter by (comma-separated; optional)
-authors = Gilbert P, Smith J
+#authors = Gilbert P, Smith J
 
 # Organizations/Affiliations to filter by (comma-separated; optional)
-organizations = Harvard Medical School, National Institutes of Health
+#organizations = Harvard Medical School, National Institutes of Health
 
 # Number of past days to include in search
 days = 30
@@ -647,83 +548,111 @@ output_file = pubmed_articles.json
 
 # Your email address (recommended for NCBI API)
 email = user@example.com
+
+# NCBI API key (optional; or set NCBI_API_KEY)
+#api_key =
 """
 
+
+def create_sample_config(filename):
+    """Create a sample configuration file. Refuses to overwrite an existing file."""
     try:
-        with open(filename, 'w') as f:
-            f.write(config_content)
-        print(f"Sample configuration file created: {filename}")
-        print("Edit the file with your desired search parameters.")
-        return True
-    except Exception as e:
-        print(f"Error creating config file: {e}")
+        with open(filename, "x") as f:
+            f.write(SAMPLE_CONFIG)
+    except OSError as e:
+        log.error("Error creating config file: %s", e)
         return False
+    log.info("Sample configuration file created: %s", filename)
+    log.info("Edit the file with your desired search parameters.")
+    return True
 
-def main():
-    """
-    Main function to run the PubMed search
-    """
-    # Parse command-line arguments
-    args = parse_arguments()
 
-    # Handle config file creation
+def resolve_settings(args, config):
+    """Merge settings with precedence: command line > environment > config file > defaults."""
+    cli = {
+        "mesh_terms": args.mesh_terms,
+        "authors": args.author,
+        "organizations": args.organization,
+        "days": args.days,
+        "max_results": args.max_results,
+        "output_file": args.output,
+        "email": args.email,
+        "api_key": args.api_key,
+    }
+    env = {"email": os.environ.get("NCBI_EMAIL"), "api_key": os.environ.get("NCBI_API_KEY")}
+    settings = dict(DEFAULTS)
+    for layer in (config, env, cli):
+        settings.update({k: v for k, v in layer.items() if v is not None})
+    return settings
+
+
+def main(argv=None):
+    """Run the PubMed search. Returns a process exit code."""
+    args = parse_arguments(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING if args.quiet else logging.INFO,
+        format="%(message)s",
+        stream=sys.stderr,
+    )
+
     if args.create_config:
-        create_sample_config(args.create_config)
-        return
+        return 0 if create_sample_config(args.create_config) else 1
 
-    # Load configuration
     config = {}
     if args.config:
         if not os.path.exists(args.config):
-            print(f"Error: Configuration file '{args.config}' not found.")
-            sys.exit(1)
-        config = load_config(args.config)
+            log.error("Error: Configuration file '%s' not found.", args.config)
+            return 1
+        try:
+            config = load_config(args.config)
+        except (configparser.Error, ValueError) as e:
+            log.error("Error reading configuration file '%s': %s", args.config, e)
+            return 1
 
-    # Override config with command-line arguments
-    mesh_terms = args.mesh_terms or config.get('mesh_terms', [])
-    authors = args.author or config.get('authors', [])
-    organizations = args.organization or config.get('organizations', [])
-    days = args.days if args.days != 30 else config.get('days', 30)
-    max_results = args.max_results if args.max_results != 1000 else config.get('max_results', 1000)
-    output_file = args.output or config.get('output_file', 'pubmed_articles.json')
-    email = args.email or config.get('email', 'user@example.com')
-
-    # Validate inputs: require at least one filtering dimension
-    if not (mesh_terms or authors or organizations):
-        print(
-            "Error: No search filters specified. Use --mesh-terms, --author, "
-            "--organization, or provide a config file."
+    settings = resolve_settings(args, config)
+    if not (settings["mesh_terms"] or settings["authors"] or settings["organizations"]):
+        log.error(
+            "Error: No search filters specified. "
+            "Use --mesh-terms, --author, --organization, or provide a config file.\n"
+            "Use --help for usage information or --create-config to create a sample config file."
         )
-        print("Use --help for usage information or --create-config to create a sample config file.")
-        sys.exit(1)
+        return 1
+    if not settings["email"]:
+        log.warning("Tip: pass --email (or set NCBI_EMAIL) so NCBI can contact you about heavy usage.")
 
-    # Initialize searcher with email
-    searcher = PubMedSearcher()
-    searcher.email = email
+    searcher = PubMedSearcher(email=settings["email"], api_key=settings["api_key"])
+    try:
+        articles = searcher.search_pubmed(
+            mesh_terms=settings["mesh_terms"],
+            authors=settings["authors"],
+            organizations=settings["organizations"],
+            days_back=settings["days"],
+            max_results=settings["max_results"],
+        )
+    except PubMedError as e:
+        log.error("%s", e)
+        return 1
 
-    # Search for articles
-    articles = searcher.search_pubmed(
-        mesh_terms=mesh_terms,
-        authors=authors,
-        organizations=organizations,
-        days_back=days,
-        max_results=max_results,
-    )
+    if articles and not args.no_fulltext:
+        searcher.add_fulltext_info(articles)
 
-    # Always check for full-text availability
+    if not args.quiet:
+        searcher.display_results(articles)
+
     if articles:
-        articles = searcher.add_fulltext_info(articles)
+        try:
+            searcher.save_to_json(articles, filename=settings["output_file"])
+        except OSError as e:
+            log.error("Error saving to file: %s", e)
+            return 1
 
-    # Display results
-    # For display, prefer MeSH terms if present, else authors/organizations
-    display_context = mesh_terms if mesh_terms else (authors if authors else organizations)
-    searcher.display_results(articles, display_context, days_back=days)
+    log.info("Search completed. Retrieved %d articles.", len(articles))
+    return 0
 
-    # Save to JSON file
-    if articles:
-        searcher.save_to_json(articles, mesh_terms or authors or organizations, filename=output_file, days_back=days)
 
-    print(f"\nSearch completed. Found {len(articles)} articles.")
+def main_cli():
+    sys.exit(main())
+
 
 if __name__ == "__main__":
-    main()
+    main_cli()
