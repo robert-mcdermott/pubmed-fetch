@@ -32,8 +32,8 @@ class Options:
     days: int = 30
     start_date: date | None = None
     end_date: date | None = None
-    date_type: str | None = None  # default: pdat, or edat with since_last_run
-    max_results: int = 1000
+    date_type: str | None = None  # default: pdat, or mdat with since_last_run
+    max_results: int | None = 1000  # None: no limit
     pmids: list[str] | None = None
     from_raw: str | None = None
     save_raw: str | None = None
@@ -57,7 +57,9 @@ class Options:
         return "pmids" if self.pmids is not None else "raw" if self.from_raw else "search"
 
     def resolved_date_type(self) -> str:
-        return self.date_type or ("edat" if self.since_last_run else "pdat")
+        # Incremental runs use the modification date: MeSH terms are added weeks to months after a
+        # record is added (edat), so an edat window misses articles indexed after it has passed.
+        return self.date_type or ("mdat" if self.since_last_run else "pdat")
 
     def validate(self) -> None:
         """Raise ValueError for invalid or conflicting options (before any network access)."""
@@ -73,6 +75,8 @@ class Options:
             raise ValueError("--since-last-run works with searches only and can't be combined with --start-date.")
         if self.download_dir and not self.fulltext:
             raise ValueError("--download-fulltext needs the full-text check; remove --no-fulltext.")
+        if self.max_results is not None and self.max_results <= 0:
+            raise ValueError("max_results must be a positive number (or None for no limit).")
         if self.resolved_date_type() not in DATE_TYPES:
             raise ValueError(f"date_type must be one of {', '.join(DATE_TYPES)}")
         if bad := set(self.download_formats) - set(DOWNLOAD_FORMATS):
@@ -172,14 +176,15 @@ def run(options: Options, session: requests.Session | None = None) -> RunResult:
     if options.since_last_run and end is not None:
         if not info["complete"]:
             log.warning("Not updating %s because some batches failed; the next run will retry.", options.since_last_run)
-        elif info.get("truncated"):
+        elif info.get("truncated") and options.max_results is not None and info["expected"] >= options.max_results:
             # Advancing past articles that weren't retrieved would skip them for good.
             log.warning(
-                "Not updating %s because not all matching articles were retrieved; raise --max-results so the next "
-                "run doesn't skip any.",
+                "Not updating %s because --max-results cut the results; use --max-results all so the next run "
+                "doesn't skip any.",
                 options.since_last_run,
             )
         else:
+            # Truncated here means PubMed's 10,000-record limit for a single day, which retrying can't fix.
             save_state(options.since_last_run, info.get("query"), date_type, end, info.get("total_found"))
 
     if not info["complete"]:

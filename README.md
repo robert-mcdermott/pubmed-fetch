@@ -26,8 +26,8 @@ uv run pubmed-fetch --mesh-terms "Breast Neoplasms" --author "Smith J" "Lee K" -
 # Raw PubMed syntax, exclusions, journal and publication-type filters
 uv run pubmed-fetch --query 'crispr[tiab] AND humans[mh]' --journal Nature Science --exclude 'Review[pt]' --output crispr.jsonl
 
-# Weekly monitoring into a SQLite database (only articles added since the last run)
-uv run pubmed-fetch --mesh-terms "Ovarian Neoplasms" --since-last-run ovarian.state.json --output ovarian.sqlite
+# Weekly monitoring into a SQLite database (articles added, indexed or updated since the last run)
+uv run pubmed-fetch --mesh-terms "Ovarian Neoplasms" --since-last-run ovarian.state.json --max-results all --output ovarian.sqlite
 
 # Fetch known PMIDs with citation metrics and pipe the JSON to another tool
 uv run pubmed-fetch --pmids pmids.txt --icite --output - -q | jq '.articles[] | {pmid, title, rcr: .metrics.relative_citation_ratio}'
@@ -55,10 +55,10 @@ Values are quoted, so multi-word values match as phrases. Repeating an option ad
 
 **Dates.** `--days N` (default 30) counts back from `--end-date` (default today); `--start-date` gives an absolute range. `--date-type` chooses which date is filtered:
 - `pdat` (default): publication date. Note that articles can be indexed weeks after their publication date and some carry future issue dates.
-- `edat`: the date the record was added to PubMed. Use this for monitoring "what's new".
-- `mdat`: last modification date.
+- `edat`: the date the record was added to PubMed. MeSH terms are added weeks to months later, so MeSH searches by `edat` miss recent articles; title/abstract and other text searches match from the start.
+- `mdat`: last modification date, which changes when MeSH terms are added and when a record is corrected or retracted. The default with `--since-last-run` (see [Incremental runs](#incremental-runs)).
 
-**Large result sets.** PubMed returns at most 10,000 records per search. When more match and `--max-results` allows, the date range is split automatically into windows that each fit, so all records can be retrieved (except on a single day with more than 10,000 matches, which is reported).
+**Large result sets.** PubMed returns at most 10,000 records per search. When more match and `--max-results` allows, the date range is split automatically into windows that each fit, so all records can be retrieved (except on a single day with more than 10,000 matches, which is reported). `--max-results` defaults to 1000; `--max-results all` removes the limit.
 
 ## Inputs other than a search
 - `--pmids FILE`: fetch specific PMIDs (whitespace/comma separated, `#` comments allowed; `-` reads stdin).
@@ -77,7 +77,7 @@ Values are quoted, so multi-word values match as phrases. Repeating an option ad
 
 Updating existing output:
 - `--merge`: update an existing file, replacing records with the same PMID (json, jsonl, csv).
-- `--resume`: continue an interrupted run, skipping PMIDs already in the output and appending the rest (jsonl, csv, sqlite, json).
+- `--resume`: continue an interrupted run, skipping PMIDs already in the output and appending the rest (jsonl, csv, sqlite, json). Skipped records are still downloaded, just not rewritten.
 
 `--summary FILE` writes the run's `search_info` as JSON (`-` for stdout), which is handy for orchestration tools.
 
@@ -207,10 +207,21 @@ print(topics["descriptor"].value_counts().head(10))
 EOF
 ```
 
-To keep the database current, run the same search on a schedule with `--since-last-run` (see [Incremental runs](#incremental-runs)); new articles are added and existing ones refreshed.
+To keep the database current, run the search on a schedule with `--since-last-run` (see [Incremental runs](#incremental-runs)). It can't be combined with `--start-date`, so drop the dates (or put a publication-date limit in `--query`):
+```bash
+uv run pubmed-fetch --mesh-terms "Ovarian Neoplasms" --query '2024:3000[dp]' --since-last-run ovarian.state.json \
+  --max-results all --icite --output ovarian.sqlite --email you@example.com
+```
+Each run adds new articles and refreshes those that changed since the last run.
 
 ## Incremental runs
-`--since-last-run STATE` starts from the end date stored in the STATE file (or from `--days` on the first run), then updates the file after a complete run. The file isn't updated when `--max-results` cut the results, since that would skip the articles that weren't retrieved. It uses the Entrez date (`edat`) unless `--date-type` is given. Runs overlap by one day so nothing indexed late is missed; use SQLite output, `--merge` or `--resume` to de-duplicate.
+`--since-last-run STATE` starts from the end date stored in the STATE file (or from `--days` on the first run), then updates the file after a complete run. It filters on the modification date (`mdat`) unless `--date-type` is given, so each run collects articles that were added, newly indexed with MeSH terms, corrected or retracted since the last run, and refreshes those already collected.
+
+- **Why `mdat`:** PubMed adds MeSH terms weeks to months after an article is added. With the Entrez date (`edat`), an article whose MeSH terms arrive after its add date has passed never matches a monitored MeSH search. In October 2026, `"Ovarian Neoplasms"[MeSH Terms]` matched 29 articles by `edat` over 7 days and 205 by `mdat`, 170 of them added more than 30 days earlier. Use `--date-type edat` for strictly newly added articles, preferably with `--title-abstract` or `--query` terms, which match from the day an article is added. (Before this change, `edat` was the default; a state file written then triggers a warning explaining how to keep it.)
+- **Write to SQLite, or use `--merge`,** so updated articles replace their old records. Runs overlap by one day so nothing is missed, and the overlap is de-duplicated the same way. Don't use `--resume` here: it skips articles already in the output, so their updates would be dropped.
+- **Use `--max-results all`.** The state isn't advanced when `--max-results` cut the results, since that would skip the articles that weren't retrieved, so a capped search would fetch the same window on every run. (A single day with more than 10,000 matches is the exception: the excess can't be retrieved at all, so the state advances with a warning.)
+- NLM sometimes updates records in bulk (on 2026-01-28, over a million records were modified in one day), so an occasional run can be much larger than usual.
+- `--since-last-run` can't be combined with `--start-date`; to also limit by publication date, add it to `--query`, e.g. `--query '2020:3000[dp]'`.
 
 ## Using a config file (INI)
 All options can go in a `[search]` section; see [sample_config.ini](sample_config.ini), or generate one with `uv run pubmed-fetch --create-config my_config.ini` (it won't overwrite an existing file). Lists are comma-separated and/or one per line; quote values that contain commas (common in MeSH terms):
@@ -220,7 +231,7 @@ mesh_terms = "Carcinoma, Ductal, Breast", Breast Neoplasms
 journals =
     Nature
     Science
-date_type = edat
+max_results = all
 icite = yes
 output_file = results.sqlite
 ```

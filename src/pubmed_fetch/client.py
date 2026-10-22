@@ -160,17 +160,22 @@ class PubMedClient:
         log.warning("PubMed interpreted the query as: %s", result.query_translation)
 
     def plan_windows(
-        self, term: str, start: date, end: date, date_type: str = "pdat", max_results: int = PUBMED_RECORD_LIMIT
+        self,
+        term: str,
+        start: date,
+        end: date,
+        date_type: str = "pdat",
+        max_results: int | None = PUBMED_RECORD_LIMIT,
     ) -> list[SearchResult]:
         """
         Search [start, end]. If more than PubMed's 10,000-record limit match and more than that
-        are wanted, split the date range in half recursively so every window can be retrieved in
-        full. The first element is the search over the whole range; the rest are the windows
-        (newest first).
+        are wanted (``max_results=None`` means all), split the date range in half recursively so
+        every window can be retrieved in full. The first element is the search over the whole
+        range; the rest are the windows (newest first).
         """
         first = self.esearch(term, start, end, date_type)
         self._check_messages(first)
-        if first.count <= PUBMED_RECORD_LIMIT or max_results <= PUBMED_RECORD_LIMIT:
+        if first.count <= PUBMED_RECORD_LIMIT or (max_results is not None and max_results <= PUBMED_RECORD_LIMIT):
             return [first, first]
         log.info(
             "%d matches exceed PubMed's %d-record limit; splitting the date range.", first.count, PUBMED_RECORD_LIMIT
@@ -202,9 +207,12 @@ class PubMedClient:
         start: date,
         end: date,
         date_type: str = "pdat",
-        max_results: int = 1000,
+        max_results: int | None = 1000,
     ) -> Iterator[list[Article]]:
-        """Search PubMed and yield batches of parsed articles. Raises PubMedError if the search fails."""
+        """
+        Search PubMed and yield batches of parsed articles; ``max_results=None`` fetches every match.
+        Raises PubMedError if the search fails.
+        """
         term = spec.build()
         if not term:
             raise PubMedError("No search terms provided.")
@@ -213,7 +221,7 @@ class PubMedClient:
 
         first, *windows = self.plan_windows(term, start, end, date_type, max_results)
         retrievable = sum(min(w.count, PUBMED_RECORD_LIMIT) for w in windows)
-        to_fetch = min(first.count, max_results, retrievable)
+        to_fetch = min(first.count, first.count if max_results is None else max_results, retrievable)
         self._init_info(
             source="search",
             query=term,
@@ -231,7 +239,8 @@ class PubMedClient:
         log.info("Found %d articles", first.count)
         if to_fetch < first.count:
             log.warning(
-                "Only %d of %d matching articles will be retrieved (raise --max-results or narrow the search).",
+                "Only %d of %d matching articles will be retrieved (raise --max-results, use --max-results all, "
+                "or narrow the search).",
                 to_fetch,
                 first.count,
             )
@@ -288,7 +297,7 @@ class PubMedClient:
         authors=None,
         organizations=None,
         days_back: int = 30,
-        max_results: int = 1000,
+        max_results: int | None = 1000,
         start_date: date | None = None,
         end_date: date | None = None,
         date_type: str = "pdat",

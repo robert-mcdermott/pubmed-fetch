@@ -50,7 +50,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 LIST_KEYS = (*FIELD_TAGS, "exclude", "download_formats")
-INT_KEYS = ("days", "max_results")
+INT_KEYS = ("days",)
 DATE_KEYS = ("start_date", "end_date")
 BOOL_KEYS = ("mesh_noexp", "fulltext", "icite", "merge", "resume", "strict")
 STR_KEYS = tuple(k for k in DEFAULTS if k not in (*LIST_KEYS, *INT_KEYS, *DATE_KEYS, *BOOL_KEYS))
@@ -111,6 +111,8 @@ def load_config(config_file: str) -> dict[str, Any]:
             settings[key] = _choice(settings[key], key)
     if "download_formats" in settings:
         settings["download_formats"] = [_choice(f, "download_formats") for f in settings["download_formats"]]
+    if "max_results" in settings:
+        settings["max_results"] = _max_results(settings["max_results"])
     return settings
 
 
@@ -137,6 +139,23 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _max_results(value: str) -> int | str:
+    """A positive number of articles, or "all"."""
+    if value.strip().lower() == "all":
+        return "all"
+    number = int(value)
+    if number <= 0:
+        raise ValueError(f"max_results must be a positive integer or 'all', got {value}")
+    return number
+
+
+def _max_results_arg(value: str) -> int | str:
+    try:
+        return _max_results(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def _iso_date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -159,7 +178,7 @@ Examples:
   %(prog)s --mesh-terms "Endometrial Neoplasms" "Ovarian Neoplasms" --days 30
   %(prog)s --author "Smith J" --start-date 2024-01-01 --end-date 2024-12-31 --output smith.csv
   %(prog)s --query 'crispr[tiab] AND humans[mh]' --exclude 'Review[pt]' --output crispr.jsonl
-  %(prog)s --mesh-terms "Breast Neoplasms" --since-last-run state.json --output breast.sqlite
+  %(prog)s --mesh-terms "Breast Neoplasms" --since-last-run state.json --max-results all --output breast.sqlite
   %(prog)s --pmids pmids.txt --icite --output - | jq .articles[].title
   %(prog)s --config config.ini
 
@@ -195,11 +214,14 @@ Environment variables: NCBI_EMAIL, NCBI_API_KEY (used when --email / --api-key a
     dates.add_argument(
         "--date-type",
         choices=DATE_TYPES,
-        help="Which date to filter on: pdat publication (default), edat added to PubMed (best for monitoring), "
-        "mdat modified",
+        help="Which date to filter on: pdat publication (default), edat added to PubMed, mdat modified, "
+        "which includes MeSH indexing (default with --since-last-run)",
     )
     dates.add_argument(
-        "--max-results", type=_positive_int, metavar="N", help="Maximum number of articles to fetch (default: 1000)"
+        "--max-results",
+        type=_max_results_arg,
+        metavar="N",
+        help="Maximum number of articles to fetch, or 'all' (default: 1000)",
     )
 
     inputs = parser.add_argument_group("input (instead of a search)")
@@ -241,7 +263,7 @@ Environment variables: NCBI_EMAIL, NCBI_API_KEY (used when --email / --api-key a
         "--since-last-run",
         metavar="STATE",
         help="Continue from the end date stored in the STATE file and update it after a complete run "
-        "(defaults --date-type to edat)",
+        "(defaults --date-type to mdat)",
     )
     other.add_argument("--email", metavar="EMAIL", help="Your email address for NCBI (recommended)")
     other.add_argument(
@@ -282,11 +304,12 @@ def build_options(settings: dict[str, Any], quiet: bool = False) -> Options:
         mesh_noexp=settings["mesh_noexp"],
     )
     names = (
-        "days start_date end_date date_type max_results from_raw save_raw output_file format merge resume summary "
+        "days start_date end_date date_type from_raw save_raw output_file format merge resume summary "
         "fulltext download_dir download_formats icite since_last_run email api_key strict"
     ).split()
     return Options(
         spec=spec,
+        max_results=None if settings["max_results"] == "all" else settings["max_results"],
         pmids=read_pmids(settings["pmids_file"]) if settings["pmids_file"] else None,
         display=not quiet,
         **{name: settings[name] for name in names},
@@ -316,9 +339,11 @@ mesh_terms = Endometrial Neoplasms, Ovarian Neoplasms
 days = 30
 #start_date = 2024-01-01
 #end_date = 2024-12-31
-# pdat = publication date, edat = date added to PubMed (best for monitoring), mdat = modified
+# pdat = publication date, edat = date added to PubMed, mdat = modified, including MeSH indexing
+# (the default with since_last_run)
 #date_type = pdat
 
+# Maximum number of articles, or "all"
 max_results = 1000
 
 # Output file; the extension (.json, .jsonl, .csv, .sqlite) selects the format unless format is set
@@ -334,7 +359,8 @@ output_file = pubmed_articles.json
 #download_formats = pdf, xml
 #icite = no
 
-# Incremental runs: continue from the end date stored in this file
+# Incremental runs: continue from the end date stored in this file (by modification date unless
+# date_type is set). Set max_results = all, or the state won't advance when results are cut.
 #since_last_run = pubmed_state.json
 
 # Save raw PubMed XML for re-parsing later with --from-raw

@@ -4,7 +4,7 @@ from datetime import date, timedelta
 import pytest
 from conftest import FakeResponse, FakeSession, efetch_handler, esearch_handler
 
-from pubmed_fetch import Options, PubMedClient, PubMedError, QuerySpec, run
+from pubmed_fetch import PUBMED_RECORD_LIMIT, Options, PubMedClient, PubMedError, QuerySpec, run
 from pubmed_fetch.pipeline import EXIT_OK, EXIT_PARTIAL
 
 
@@ -63,10 +63,10 @@ def test_since_last_run_uses_and_updates_state(tmp_path):
     run(opts, session=session)
     first = session.calls_to("esearch.fcgi")[0]
     today = date.today()
-    assert first["datetype"] == "edat"
+    assert first["datetype"] == "mdat"
     assert first["mindate"] == (today - timedelta(days=3)).strftime("%Y/%m/%d")
     saved = json.loads(state.read_text())
-    assert (saved["last_end_date"], saved["date_type"]) == (today.isoformat(), "edat")
+    assert (saved["last_end_date"], saved["date_type"]) == (today.isoformat(), "mdat")
 
     state.write_text(json.dumps({**saved, "last_end_date": "2024-05-01"}))
     run(
@@ -93,7 +93,30 @@ def test_since_last_run_state_not_updated_on_truncated_run(tmp_path, caplog):
     # The run itself succeeded, but advancing would skip the 3 articles that weren't retrieved.
     assert result.exit_code == EXIT_OK and result.search_info["truncated"]
     assert json.loads(state.read_text())["last_end_date"] == "2024-05-01"
-    assert "not all matching articles were retrieved" in caplog.text
+    assert "--max-results cut the results" in caplog.text
+
+
+def test_since_last_run_advances_past_pubmeds_daily_limit(tmp_path, monkeypatch):
+    # More than 10,000 matches on one day can never be retrieved, so holding the state back would
+    # stall every later run on the same window.
+    monkeypatch.setattr(PubMedClient, "batch_size", 5000)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"last_end_date": date.today().isoformat(), "query": None, "date_type": "mdat"}))
+    session = FakeSession({"esearch.fcgi": esearch_handler(PUBMED_RECORD_LIMIT + 5), "efetch.fcgi": efetch_handler()})
+    opts = options(tmp_path, since_last_run=str(state), max_results=None, output_file=str(tmp_path / "out.jsonl"))
+    result = run(opts, session=session)
+    assert result.search_info["truncated"] and result.search_info["max_results"] is None
+    # save_state wrote it (the initial state had no last_total_found).
+    assert json.loads(state.read_text())["last_total_found"] == PUBMED_RECORD_LIMIT + 5
+
+
+def test_state_written_with_edat_explains_the_new_default(tmp_path, caplog):
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"last_end_date": "2024-05-01", "query": '("X"[MeSH Terms])', "date_type": "edat"}))
+    session = FakeSession({"esearch.fcgi": esearch_handler(1), "efetch.fcgi": efetch_handler()})
+    run(options(tmp_path, since_last_run=str(state)), session=session)
+    assert "Pass --date-type edat to keep the previous behavior" in caplog.text
+    assert "different query" not in caplog.text
 
 
 def test_resume_skips_existing_records(tmp_path):

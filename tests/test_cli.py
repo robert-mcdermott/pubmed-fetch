@@ -18,6 +18,21 @@ def test_parse_arguments():
     assert (args.days, args.mesh_noexp, args.fulltext, args.icite, args.merge) == (45, True, False, True, None)
 
 
+def test_max_results_all(tmp_path):
+    assert parse_arguments(["--mesh-terms", "X", "--max-results", "ALL"]).max_results == "all"
+    options = build_options(resolve_settings(parse_arguments(["--mesh-terms", "X", "--max-results", "all"]), {}))
+    assert options.max_results is None
+    config_file = tmp_path / "c.ini"
+    config_file.write_text("[search]\nmax_results = all\n")
+    assert load_config(str(config_file)) == {"max_results": "all"}
+    config_file.write_text("[search]\nmax_results = lots\n")
+    with pytest.raises(ValueError):
+        load_config(str(config_file))
+    for bad in ("0", "lots"):
+        with pytest.raises(SystemExit):
+            parse_arguments(["--mesh-terms", "X", "--max-results", bad])
+
+
 def test_repeated_list_options_accumulate():
     args = parse_arguments(
         ["--author", "Smith J", "--author", "Lee K", "Kim S", "--mesh-terms", "A", "--mesh-terms", "B"]

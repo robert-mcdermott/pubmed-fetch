@@ -37,7 +37,7 @@ Output schema version 2. The authoritative JSON Schema is `src/pubmed_fetch/sche
 
 ## search_info (run metadata)
 
-`tool` (name, version), `generated_on` (UTC), `source` (`search`, `pmids` or `raw`), `query`, `query_translation` (what PubMed actually ran), `query_warnings`, `filters`, `date_type`, `date_range`, `date_windows`, `total_found` (matches in PubMed), `max_results`, `expected`, `retrieved`, `truncated` (results were capped), `complete` (no batch failed), `failed_batches`, `skipped_records`, `skipped_existing` (`--resume`), `fulltext_lookup_failures`, `icite_lookup_failures`, `downloads`, `total_articles` (articles in the output file or database).
+`tool` (name, version), `generated_on` (UTC), `source` (`search`, `pmids` or `raw`), `query`, `query_translation` (what PubMed actually ran), `query_warnings`, `filters`, `date_type`, `date_range`, `date_windows`, `total_found` (matches in PubMed), `max_results` (null = all), `expected`, `retrieved`, `truncated` (results were capped), `complete` (no batch failed), `failed_batches`, `skipped_records`, `skipped_existing` (`--resume`), `fulltext_lookup_failures`, `icite_lookup_failures`, `downloads`, `total_articles` (articles in the output file or database).
 
 ## SQLite tables
 

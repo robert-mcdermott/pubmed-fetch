@@ -2,11 +2,16 @@
 
 ## Unreleased
 
+### Changed
+- `--since-last-run` now filters on the modification date (`mdat`) instead of the Entrez date (`edat`) unless `--date-type` is given. PubMed adds MeSH terms weeks to months after an article is added, so `edat` monitoring of MeSH searches missed most articles (in a 7-day test, 29 by `edat` versus 205 by `mdat`). Runs now also refresh articles that changed. Pass `--date-type edat` for the old behavior; a state file written with `edat` triggers a warning saying so.
+
 ### Fixed
 - Repeating a list option kept only its last value: `--author A --author B` searched for B only. Values now accumulate, as with `--author A B` (also for `--download-formats`).
-- `--since-last-run` advanced its state even when `--max-results` (or PubMed's 10,000-record limit) cut the results, so later runs skipped the articles that weren't retrieved. The state now stays put, with a warning.
+- `--since-last-run` advanced its state even when `--max-results` cut the results, so later runs skipped the articles that weren't retrieved. The state now stays put, with a warning. (A single day over PubMed's 10,000-record limit still advances it, since retrying can't retrieve the excess.)
+- The docs recommended `--resume` to de-duplicate incremental runs, which drops updated records; they now recommend SQLite output or `--merge`.
 
 ### Added
+- `--max-results all` (and `max_results = all` in config files, `max_results=None` in the library) for no limit; `search_info.max_results` is then `null`.
 - Agent skill for AI coding agents (Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, Devin, …) in `skills/pubmed-fetch/`, following the Agent Skills standard. See "Using pubmed-fetch from AI coding agents" in the README.
 
 ## 0.3.0

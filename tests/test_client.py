@@ -86,6 +86,20 @@ def test_large_searches_are_split_into_date_windows():
     assert client.search_info["truncated"] is False
 
 
+def test_max_results_none_fetches_every_match():
+    client = make_client({"esearch.fcgi": esearch_handler(250), "efetch.fcgi": efetch_handler()})
+    articles = collect(client.iter_search(QuerySpec(mesh_terms=["X"]), START, END, max_results=None))
+    assert len(articles) == 250
+    info = client.search_info
+    assert (info["max_results"], info["expected"], info["truncated"]) == (None, 250, False)
+
+
+def test_max_results_none_splits_large_results():
+    client = make_client({"esearch.fcgi": esearch_handler(PUBMED_RECORD_LIMIT + 1), "efetch.fcgi": efetch_handler()})
+    assert len(client.plan_windows("x", START, END, max_results=PUBMED_RECORD_LIMIT)) == 2  # no split
+    assert len(client.plan_windows("x", START, END, max_results=None)) > 2
+
+
 def test_no_splitting_when_fewer_than_the_limit_are_wanted():
     client = make_client({"esearch.fcgi": esearch_handler(50000), "efetch.fcgi": efetch_handler()})
     collect(client.iter_search(QuerySpec(mesh_terms=["X"]), START, END, max_results=10))

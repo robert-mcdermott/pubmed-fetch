@@ -40,7 +40,7 @@ Below, `pubmed-fetch` stands for whichever prefix applies. Check it works with `
    - A non-empty `query_warnings` (e.g. `QuotedPhraseNotFound`) means a term wasn't recognized. Fix it before collecting; see [Finding the right MeSH term](#finding-the-right-mesh-term).
    - The "Only 1 of N matching articles will be retrieved" warning is expected for a probe.
    - If `total_found` is in the thousands, confirm the scope with the user or narrow it before fetching everything.
-3. **Collect** into a file. Choose the format by purpose (section 4) and set `--max-results` deliberately (default 1000).
+3. **Collect** into a file. Choose the format by purpose (section 4) and set `--max-results` deliberately (default 1000; `all` for every match).
 4. **Check completeness before using the data.** Exit code `0` means complete, `2` means partial (some batches failed; data is still written), `1` means error. `search_info.complete` and `search_info.failed_batches` say the same in the output.
 5. **Read results with `jq` or `sqlite3`.** Never `cat` a large output file into the conversation. Extract only the fields you need (section 6).
 6. **Report the query and its scope** when answering: the query translation, date range and date type, `total_found` versus retrieved, and whether results were capped by `--max-results`.
@@ -66,8 +66,8 @@ Filters are ORed within one option and ANDed across options; values are quoted a
 - `--start-date YYYY-MM-DD [--end-date YYYY-MM-DD]` gives an absolute range.
 - `--date-type`:
   - `pdat` (default): publication date. It also matches electronic publication dates, so a 2025 range can include records whose issue date is 2026.
-  - `edat`: when the record was added to PubMed. Use it for "what's new" and monitoring.
-  - `mdat`: last modified.
+  - `edat`: when the record was added to PubMed. MeSH terms are added weeks to months later, so combine `edat` with `--title-abstract`/`--query` text terms, not `--mesh-terms`.
+  - `mdat`: last modified, including when MeSH terms are added. The default for monitoring (`--since-last-run`).
 
 **Inputs other than a search:** `--pmids FILE` (or `--pmids -` to read stdin) fetches known PMIDs; `--from-raw DIR` re-parses XML saved earlier with `--save-raw DIR`.
 
@@ -153,12 +153,13 @@ This takes minutes (roughly 200 records per request at 3 requests/second, faster
 
 **"Track new publications on this topic every week"**
 ```bash
-pubmed-fetch --mesh-terms "Ovarian Neoplasms" --since-last-run ~/pubmed/ovarian.state.json \
+pubmed-fetch --mesh-terms "Ovarian Neoplasms" --since-last-run ~/pubmed/ovarian.state.json --max-results all \
   --output ~/pubmed/ovarian.sqlite -q --summary - | jq '{date_range, total_found, total_articles, complete}'
 ```
-- The first run uses `--days` (default 30). Later runs start from the last run's end date, using `edat`.
+- The first run uses `--days` (default 30). Later runs start from the last run's end date, by modification date (`mdat`): that catches articles when they get their MeSH terms, which can be weeks to months after they're added, and refreshes ones already collected.
+- Use SQLite (or `--merge`) so refreshed articles replace their old records; never `--resume`, which would drop the updates. `--start-date` can't be combined with `--since-last-run`; put a publication-date limit in `--query '2020:3000[dp]'` instead.
 - Runs overlap by one day on purpose. `total_found` counts this run's window and `total_articles` counts the whole database, so seeing the same few articles again on a same-day rerun is normal.
-- The state only advances after a complete run that retrieved every match. If more articles match than `--max-results` (default 1000) allows, the state stays put and a warning says so; raise `--max-results`.
+- The state only advances after a complete run that retrieved every match. If more articles match than `--max-results` allows, the state stays put and a warning says so; keep `--max-results all`.
 
 ## 6. Reading results efficiently
 
@@ -182,7 +183,8 @@ For SQLite, see the tables and example queries in [reference.md](reference.md). 
 
 - **Values within one option are ORed.** To require two concepts, put them in different options or use `--query`.
 - `--days` and `--start-date` can't be combined. `--since-last-run` can't be used with `--start-date` or `--pmids`.
-- `--max-results` defaults to 1000. A warning reports how many matched versus how many were retrieved; mention it when it applies.
+- `--max-results` defaults to 1000 (`all` for no limit). A warning reports how many matched versus how many were retrieved; mention it when it applies.
+- Don't monitor `--mesh-terms` searches by `edat`: articles indexed after their add date are missed. `--since-last-run` uses `mdat` by default.
 - Missing values are `null` (never "N/A"). `date` may be just a year (`date_precision`), and `date_raw` holds text such as "1998 Winter".
 - `record_type: "book"` records (NCBI Bookshelf) have no journal and use `book_title`.
 - An exit code of 2 means some data is missing. Say so, or rerun with `--resume` (append) or `--merge` (refresh).

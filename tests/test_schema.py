@@ -35,7 +35,12 @@ def test_enriched_record_matches_schema(validator):
 def test_full_output_document_matches_schema(tmp_path):
     session = FakeSession({"esearch.fcgi": esearch_handler(2), "efetch.fcgi": efetch_handler()})
     out = tmp_path / "out.json"
-    run(Options(spec=QuerySpec(mesh_terms=["X"]), fulltext=False, display=False, output_file=str(out)), session=session)
+    run(
+        Options(
+            spec=QuerySpec(mesh_terms=["X"]), fulltext=False, display=False, output_file=str(out), max_results=None
+        ),
+        session=session,
+    )
     jsonschema.validate(json.loads(out.read_text()), load_schema())
 
 
