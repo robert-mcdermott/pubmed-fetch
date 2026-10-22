@@ -180,7 +180,8 @@ Environment variables: NCBI_EMAIL, NCBI_API_KEY (used when --email / --api-key a
         ("--language", "languages", "LANGUAGE", "e.g. english"),
         ("--exclude", "exclude", "EXPR", 'PubMed expressions to exclude with NOT, e.g. "Review[pt]"'),
     ):
-        filters.add_argument(flag, dest=dest, metavar=metavar, nargs="+", help=help_text)
+        # "extend": --author A --author B collects both, like --author A B.
+        filters.add_argument(flag, dest=dest, metavar=metavar, nargs="+", action="extend", help=help_text)
     filters.add_argument("--query", metavar="QUERY", help="A raw PubMed query, ANDed with the other filters")
     _flag(filters, "--mesh-noexp", dest="mesh_noexp", help="Don't include narrower MeSH terms")
 
@@ -227,7 +228,11 @@ Environment variables: NCBI_EMAIL, NCBI_API_KEY (used when --email / --api-key a
         "--download-fulltext", dest="download_dir", metavar="DIR", help="Download available PMC full-text files"
     )
     enrich.add_argument(
-        "--download-formats", nargs="+", choices=DOWNLOAD_FORMATS, help="Formats to download (default: pdf)"
+        "--download-formats",
+        nargs="+",
+        action="extend",
+        choices=DOWNLOAD_FORMATS,
+        help="Formats to download (default: pdf)",
     )
     _flag(enrich, "--icite", dest="icite", help="Add NIH iCite citation metrics")
 

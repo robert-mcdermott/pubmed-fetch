@@ -49,7 +49,7 @@ uv run pubmed-fetch --mesh-terms "Ovarian Neoplasms" --days 7 --download-fulltex
 | `--query` | raw PubMed syntax, ANDed with the filters |
 | `--exclude` | raw expressions removed with `NOT` |
 
-Values are quoted, so multi-word values match as phrases. The query PubMed actually ran is recorded in `search_info.query_translation`.
+Values are quoted, so multi-word values match as phrases. Repeating an option adds to it: `--author A --author B` is the same as `--author A B`. The query PubMed actually ran is recorded in `search_info.query_translation`.
 
 **Typos are reported.** If PubMed doesn't recognize a term (e.g. a misspelled MeSH heading) or a field tag, a warning is printed and stored in `search_info.query_warnings`. With `--strict`, the run fails instead.
 
@@ -210,7 +210,7 @@ EOF
 To keep the database current, run the same search on a schedule with `--since-last-run` (see [Incremental runs](#incremental-runs)); new articles are added and existing ones refreshed.
 
 ## Incremental runs
-`--since-last-run STATE` starts from the end date stored in the STATE file (or from `--days` on the first run), then updates the file after a complete run. It uses the Entrez date (`edat`) unless `--date-type` is given. Runs overlap by one day so nothing indexed late is missed; use SQLite output, `--merge` or `--resume` to de-duplicate.
+`--since-last-run STATE` starts from the end date stored in the STATE file (or from `--days` on the first run), then updates the file after a complete run. The file isn't updated when `--max-results` cut the results, since that would skip the articles that weren't retrieved. It uses the Entrez date (`edat`) unless `--date-type` is given. Runs overlap by one day so nothing indexed late is missed; use SQLite output, `--merge` or `--resume` to de-duplicate.
 
 ## Using a config file (INI)
 All options can go in a `[search]` section; see [sample_config.ini](sample_config.ini), or generate one with `uv run pubmed-fetch --create-config my_config.ini` (it won't overwrite an existing file). Lists are comma-separated and/or one per line; quote values that contain commas (common in MeSH terms):

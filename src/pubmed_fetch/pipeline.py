@@ -170,10 +170,17 @@ def run(options: Options, session: requests.Session | None = None) -> RunResult:
     if options.summary:
         write_summary(options.summary, info)
     if options.since_last_run and end is not None:
-        if info["complete"]:
-            save_state(options.since_last_run, info.get("query"), date_type, end, info.get("total_found"))
-        else:
+        if not info["complete"]:
             log.warning("Not updating %s because some batches failed; the next run will retry.", options.since_last_run)
+        elif info.get("truncated"):
+            # Advancing past articles that weren't retrieved would skip them for good.
+            log.warning(
+                "Not updating %s because not all matching articles were retrieved; raise --max-results so the next "
+                "run doesn't skip any.",
+                options.since_last_run,
+            )
+        else:
+            save_state(options.since_last_run, info.get("query"), date_type, end, info.get("total_found"))
 
     if not info["complete"]:
         log.warning("Run incomplete: %d batch(es) failed. See search_info.failed_batches.", len(info["failed_batches"]))

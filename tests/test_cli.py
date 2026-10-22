@@ -18,6 +18,18 @@ def test_parse_arguments():
     assert (args.days, args.mesh_noexp, args.fulltext, args.icite, args.merge) == (45, True, False, True, None)
 
 
+def test_repeated_list_options_accumulate():
+    args = parse_arguments(
+        ["--author", "Smith J", "--author", "Lee K", "Kim S", "--mesh-terms", "A", "--mesh-terms", "B"]
+        + ["--download-formats", "pdf", "--download-formats", "xml"]
+    )
+    assert args.authors == ["Smith J", "Lee K", "Kim S"]
+    assert args.mesh_terms == ["A", "B"]
+    assert args.download_formats == ["pdf", "xml"]
+    # Unset lists stay None, so config file values still apply.
+    assert args.journals is None and args.exclude is None
+
+
 @pytest.mark.parametrize(
     "bad",
     [

@@ -158,7 +158,7 @@ pubmed-fetch --mesh-terms "Ovarian Neoplasms" --since-last-run ~/pubmed/ovarian.
 ```
 - The first run uses `--days` (default 30). Later runs start from the last run's end date, using `edat`.
 - Runs overlap by one day on purpose. `total_found` counts this run's window and `total_articles` counts the whole database, so seeing the same few articles again on a same-day rerun is normal.
-- The state only advances after a complete run.
+- The state only advances after a complete run that retrieved every match. If more articles match than `--max-results` (default 1000) allows, the state stays put and a warning says so; raise `--max-results`.
 
 ## 6. Reading results efficiently
 

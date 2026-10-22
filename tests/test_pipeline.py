@@ -85,6 +85,17 @@ def test_since_last_run_state_not_updated_on_partial_run(tmp_path):
     assert json.loads(state.read_text())["last_end_date"] == "2024-05-01"
 
 
+def test_since_last_run_state_not_updated_on_truncated_run(tmp_path, caplog):
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"last_end_date": "2024-05-01", "query": None, "date_type": "edat"}))
+    session = FakeSession({"esearch.fcgi": esearch_handler(5), "efetch.fcgi": efetch_handler()})
+    result = run(options(tmp_path, since_last_run=str(state), max_results=2), session=session)
+    # The run itself succeeded, but advancing would skip the 3 articles that weren't retrieved.
+    assert result.exit_code == EXIT_OK and result.search_info["truncated"]
+    assert json.loads(state.read_text())["last_end_date"] == "2024-05-01"
+    assert "not all matching articles were retrieved" in caplog.text
+
+
 def test_resume_skips_existing_records(tmp_path):
     out = tmp_path / "out.jsonl"
     session = FakeSession({"esearch.fcgi": esearch_handler(3), "efetch.fcgi": efetch_handler()})
